@@ -32,7 +32,7 @@ except ImportError:
 STATE_FILE = "bot_state_multi_strategy.json"
 
 
-# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v8.9 No-BTC, Super-Relaxed) ---
+# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v9.1 PA-Restored) ---
 class TradingBot(threading.Thread):
     
     def __init__(self, api_key, api_secret, event_queue, risk_per_trade, rr_ratio, symbol, active_strategies_config, backtest_client=None):
@@ -183,7 +183,7 @@ class TradingBot(threading.Thread):
 
     def run(self):
         # --- ИЗМЕНЕНИЕ: Название бота ---
-        bot_name = "Multi-Strategy Trader v8.9 (No-BTC, Super-Relaxed)"
+        bot_name = "Multi-Strategy Trader v9.1 (PA-Restored)"
         mode = "БЭКТЕСТ (1M)" if self.is_backtest else "РЕАЛЬНАЯ ТОРГОВЛЯ" 
         self.log(f"Запуск бота '{bot_name}' в режиме '{mode}' для символа {self.symbol}...")
         
@@ -285,7 +285,7 @@ class TradingBot(threading.Thread):
         self.log(status_msg)
 
     # ---
-    # --- ИЗМЕНЕНО: ГЛАВНАЯ ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v8.9) ---
+    # --- ИЗМЕНЕНО: ГЛАВНАЯ ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v9.1) ---
     # ---
     def _get_algorithmic_decision(self, market_data, current_price):
         
@@ -324,6 +324,7 @@ class TradingBot(threading.Thread):
         # --- Стратегия 3: Momentum Pullback (Нужен 1D тренд) ---
         if self.active_strategies.get("MOMENTUM_1H", False):
             # --- ИЗМЕНЕНИЕ: Убран 'is_btc_bull_trend' ---
+            # --- (v9.0) Эта функция использует СТРОГИЕ фильтры ---
             signal = self._find_entry_momentum_pullback_1h(market_data, current_price, is_1d_bull_trend)
             if signal: all_potential_signals.append(signal)
 
@@ -334,6 +335,7 @@ class TradingBot(threading.Thread):
 
         # --- Стратегия 5: Swing (Price Action) (Не зависит от 1D тренда) ---
         if self.active_strategies.get("PRICE_ACTION", False):
+            # --- (v9.1) Эта функция использует фильтры v8.6 ---
             signal = self._find_entry_price_action_1h(market_data, current_price, key_levels)
             if signal: all_potential_signals.append(signal)
         
@@ -376,7 +378,7 @@ class TradingBot(threading.Thread):
         return levels
 
     # ---
-    # --- ИЗМЕНЕННЫЕ СТРАТЕГИИ (v8.9) ---
+    # --- ИЗМЕНЕННЫЕ СТРАТЕГИИ (v8.9 / v9.0 / v9.1) ---
     # ---
 
     # --- СТРАТЕГИЯ 6 (ИЗМЕНЕНО): EMA Pullback (Откат к EMA) ---
@@ -499,43 +501,50 @@ class TradingBot(threading.Thread):
             "rr_ratio": rr_ratio
         }
 
-    # --- СТРАТЕГИЯ 5 (ИЗМЕНЕНО): Price Action (PA 1H) ---
+    # --- СТРАТЕГИЯ 5 (ИЗМЕНЕНО v9.1): Price Action (PA 1H) - Возвращена логика v8.6 ---
     def _find_entry_price_action_1h(self, market_data, current_price, key_levels):
        ind_1h = market_data.get('indicators_1h')
        if ind_1h is None or len(ind_1h) < 20: return None
        
        signal_candle, prev_candle = ind_1h.iloc[-1], ind_1h.iloc[-2]
        
-       # 1. Ищем бычий паттерн
+       # 1. Ищем бычий паттерн (v8.6 не было pin_bar)
        is_hammer, is_engulfing = self._is_bullish_hammer(signal_candle), self._is_bullish_engulfing(prev_candle, signal_candle)
-       is_pin_bar = self._is_bullish_pin_bar(signal_candle)
-       if not (is_hammer or is_engulfing or is_pin_bar): return None
+       if not (is_hammer or is_engulfing): 
+           self.log("Пропуск Price Action: Нет бычьего паттерна (Hammer/Engulfing)."); return None
            
        try:
            rsi_1h = Decimal(str(signal_candle['RSI_14']))
            avg_volume = ind_1h['volume'].tail(10).mean()
            signal_volume = Decimal(str(signal_candle['volume']))
            atr_1h = Decimal(str(signal_candle[f'ATRr_{self.atr_period}']))
+           # --- НОВЫЙ РАСЧЕТ ATR % (v9.1) ---
+           atr_perc = (atr_1h / current_price) * 100 if current_price > 0 else Decimal('0')
        except (ValueError, KeyError):
             self.log("Пропуск Price Action: Ошибка данных RSI/Volume/ATR."); return None
             
-       # 2. ИЗМЕНЕННЫЙ ФИЛЬТР: RSI должен быть < 50
-       # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 45) ---
-       if rsi_1h >= 50: 
-           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в зоне < 50."); return None
+       # 2. ИЗМЕНЕННЫЙ ФИЛЬТР (v9.1): RSI должен быть в диапазоне 40-70
+       # --- ИЗМЕНЕНИЕ: (Было < 40 в v9.0) ---
+       if rsi_1h <= 40 or rsi_1h >= 70: 
+           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в диапазоне 40-70."); return None
            
-       # 3. Цена у 4H поддержки
-       is_near_support = any(abs(current_price - support) / support < Decimal('0.015') for support in key_levels['supports'])
+       # 3. Цена у 4H поддержки (v8.6 было 2%)
+       # --- ИЗМЕНЕНИЕ: (Было 1.5% в v9.0) ---
+       is_near_support = any(abs(current_price - support) / support < Decimal('0.02') for support in key_levels['supports'])
        if not is_near_support: 
-           self.log("Пропуск Price Action: Цена не у 4H поддержки."); return None
+           self.log("Пропуск Price Action: Цена не у 4H поддержки (зона 2%)."); return None
            
        # 4. Объем выше среднего
        if signal_volume <= Decimal(str(avg_volume)): 
            self.log("Пропуск Price Action: Объем не выше среднего."); return None
            
-       # 5. Расчет R:R
+       # --- НОВЫЙ ФИЛЬТР (v9.1, из v8.6): ATR < 3% ---
+       if atr_perc > 3:
+           self.log(f"Пропуск Price Action: ATR {atr_perc:.2f}% > 3% (высокая волатильность)."); return None
+
+       # 5. Расчет R:R (v9.0)
        entry_price = current_price
-       stop_loss_price = self._round_price(Decimal(str(signal_candle['low'])) - (atr_1h * Decimal('0.2')))
+       stop_loss_price = self._round_price(Decimal(str(signal_candle['low'])) - (atr_1h * Decimal('0.2'))) # SL под свечой
        risk_per_coin = entry_price - stop_loss_price
        if risk_per_coin <= 0: return None
        
@@ -548,9 +557,9 @@ class TradingBot(threading.Thread):
        if reward_per_coin <= 0: return None
        
        rr_ratio = reward_per_coin / risk_per_coin
-       pattern_type = "hammer" if is_hammer else ("engulfing" if is_engulfing else "pin_bar")
+       pattern_type = "hammer" if is_hammer else "engulfing"
        
-       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type}, RSI < 50, у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+       self.log(f"    -> Кандидат (Price Action 1H [v8.6 logic]): Паттерн {pattern_type}, RSI (40-70), у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
        return {
             "type": "PRICE_ACTION",
             "entry_price": entry_price,
@@ -686,7 +695,7 @@ class TradingBot(threading.Thread):
             "rr_ratio": rr_ratio
         }
 
-    # --- СТРАТЕГИЯ 3 (ИЗМЕНЕНО): Momentum Pullback (1H) ---
+    # --- СТРАТЕГИЯ 3 (ИЗМЕНЕНО v9.0, СТРОГАЯ): Momentum Pullback (1H) ---
     # --- ИЗМЕНЕНИЕ: Убран 'is_btc_bull_trend' ---
     def _find_entry_momentum_pullback_1h(self, market_data, current_price, is_1d_bull_trend):
         # --- ИЗМЕНЕНИЕ: Проверка 1D тренда (БЕЗ BTC) ---
@@ -713,18 +722,27 @@ class TradingBot(threading.Thread):
             ema_21_1h = Decimal(str(last_1h[f'EMA_{self.ema_fast_len}']))
             if ema_9_1h <= ema_21_1h:
                 self.log(f"Пропуск Momentum Pullback: 1H EMA9 ({ema_9_1h}) <= 1H EMA21 ({ema_21_1h})."); return None
+            
+            # --- НОВЫЙ ФИЛЬТР (v9.0): Цена должна быть близко к EMA 21 ---
+            if current_price > (ema_21_1h * Decimal('1.003')):
+                self.log(f"Пропуск Momentum Pullback: Цена ({current_price:.2f}) слишком далеко от 1H EMA21 ({ema_21_1h:.2f})."); return None
                 
-            # 3. ИЗМЕНЕННЫЙ СИГНАЛ: Ищем 1H откат (StochRSI в перепроданности)
+            # 3. ИЗМЕНЕННЫЙ СИГНАЛ (v9.0): Ищем 1H откат (StochRSI в перепроданности)
             stoch_k_1h = Decimal(str(last_1h['STOCHRSIk_14_14_3_3']))
             stoch_d_1h = Decimal(str(last_1h['STOCHRSId_14_14_3_3']))
             stoch_k_prev_1h = Decimal(str(prev_1h['STOCHRSIk_14_14_3_3']))
             
-            # StochK должен быть < 40 (ОСЛАБЛЕНО) и пересекать StochD снизу вверх
-            # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 35) ---
-            is_oversold_cross = (stoch_k_1h < 40) and (stoch_k_prev_1h <= stoch_d_1h) and (stoch_k_1h > stoch_d_1h)
+            # StochK должен быть < 30 (УЖЕСТОЧЕНО) и пересекать StochD снизу вверх
+            # --- ИЗМЕНЕНИЕ (v9.0): StochK < 30 (было 40) ---
+            is_oversold_cross = (stoch_k_1h < 30) and (stoch_k_prev_1h <= stoch_d_1h) and (stoch_k_1h > stoch_d_1h)
             
             if not is_oversold_cross:
-                self.log("Пропуск Momentum Pullback: Нет StochRSI пересечения в зоне < 40."); return None
+                self.log("Пропуск Momentum Pullback: Нет StochRSI пересечения в зоне < 30."); return None
+
+            # --- НОВЫЙ ФИЛЬТР (v9.0): Требуем 1H PA подтверждение ---
+            is_hammer, is_engulfing = self._is_bullish_hammer(last_1h), self._is_bullish_engulfing(prev_1h, last_1h)
+            if not (is_hammer or is_engulfing):
+                self.log("Пропуск Momentum Pullback: Нет 1H паттерна (Hammer/Engulfing) на StochRSI сигнале."); return None
 
         except (ValueError, KeyError):
             self.log("Пропуск Momentum Pullback: Ошибка данных EMA/StochRSI."); return None
@@ -741,7 +759,7 @@ class TradingBot(threading.Thread):
         target_tp = self._round_price(entry_price + reward_per_coin)
         rr_ratio = Decimal('2.0')
         
-        self.log(f"    -> Кандидат (Momentum Pullback): StochRSI откат в 1H/4H аптренде. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        self.log(f"    -> Кандидат (Momentum Pullback): StochRSI+PA откат в 1H/4H аптренде. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {
             "type": "MOMENTUM_1H",
             "entry_price": entry_price,
