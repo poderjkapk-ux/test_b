@@ -383,19 +383,31 @@ class TradingBot(threading.Thread):
             ema21_prev = Decimal(str(prev_candle[f'EMA_{self.ema_fast_len}']))
             ema9_signal = Decimal(str(signal_candle[f'EMA_{self.ema_superfast_len}']))
             ema21_signal = Decimal(str(signal_candle[f'EMA_{self.ema_fast_len}']))
+            
+            # --- УЛУЧШЕНИЕ: Добавляем EMA 50 для фильтра ---
+            ema50_signal = Decimal(str(signal_candle[f'EMA_{self.ema_slow_len}']))
+            
             rsi_signal = Decimal(str(signal_candle['RSI_14']))
         except (ValueError, KeyError):
             self.log("Пропуск EMA cross: Недопустимые значения EMA/RSI.")
             return None
+            
         if not (ema9_prev < ema21_prev and ema9_signal > ema21_signal): 
             self.log("Пропуск EMA cross: Нет пересечения EMA 9/21."); return None
+
+        # --- УЛУЧШЕНИЕ: Пересечение должно быть выше EMA 50 ---
+        if ema21_signal < ema50_signal:
+            self.log(f"Пропуск EMA cross: Пересечение ниже EMA 50 (EMA21: {ema21_signal:.2f} < EMA50: {ema50_signal:.2f})."); return None
+
         if rsi_signal < 50: 
             self.log(f"Пропуск EMA cross: RSI ({rsi_signal:.1f}) < 50."); return None
+            
         entry_price = market_data['current_price']
         is_near_support = any(abs(entry_price - support) / support < Decimal('0.01') for support in key_levels['supports'])
         if not is_near_support: 
             self.log("Пропуск EMA cross: Цена не у поддержки."); return None
-        self.log(f"    -> СИГНАЛ (EMA Cross 4H): EMA 9/21 пересеклись, RSI ({rsi_signal:.1f}) > 50 и цена у поддержки.")
+            
+        self.log(f"    -> СИГНАЛ (EMA Cross 4H): EMA 9/21 пересеклись, RSI ({rsi_signal:.1f}) > 50, цена у поддержки, EMA21 > EMA50.")
         return {"decision": "BUY", "signal_candle": signal_candle, "type": "EMA_CROSS"}
 
     def _find_entry_rsi_divergence_4h(self, market_data, key_levels):
@@ -408,21 +420,30 @@ class TradingBot(threading.Thread):
         rsi_lows = recent_data[(recent_data['RSI_14'] < recent_data['RSI_14'].shift(1)) & (recent_data['RSI_14'] < recent_data['RSI_14'].shift(-1))]
         if len(rsi_lows) < 2: 
             self.log("Пропуск RSI divergence: Менее 2 минимумов RSI."); return None
+            
         last_rsi_low_val, prev_rsi_low_val = rsi_lows.iloc[-1]['RSI_14'], rsi_lows.iloc[-2]['RSI_14']
         last_rsi_low_idx, prev_rsi_low_idx = rsi_lows.index[-1], rsi_lows.index[-2]
+
+        # --- УЛУЧШЕНИЕ: Первый минимум должен быть в зоне < 40 ---
+        if not (prev_rsi_low_val < 40):
+            self.log(f"Пропуск RSI divergence: Первый минимум RSI ({prev_rsi_low_val:.1f}) не находится в зоне < 40."); return None
+
         if not (last_rsi_low_val > prev_rsi_low_val): 
             self.log("Пропуск RSI divergence: Нет более высокого минимума RSI."); return None
+            
         price_at_last_rsi_low, price_at_prev_rsi_low = recent_data.loc[last_rsi_low_idx]['low'], recent_data.loc[prev_rsi_low_idx]['low']
         if not (price_at_last_rsi_low < price_at_prev_rsi_low): 
             self.log("Пропуск RSI divergence: Нет более низкого минимума цены."); return None
+            
         data_after_divergence = recent_data.loc[last_rsi_low_idx:]
         confirmation_high = data_after_divergence.iloc[0]['high']
         for i in range(1, len(data_after_divergence)):
             if data_after_divergence.iloc[i]['close'] > confirmation_high:
                 signal_candle = data_after_divergence.iloc[i]
                 stop_loss_ref_candle = data_after_divergence.iloc[0]
-                self.log(f"    -> СИГНАЛ (RSI Divergence 4H): Найдена бычья дивергенция и подтверждающая свеча.")
+                self.log(f"    -> СИГНАЛ (RSI Divergence 4H): Найдена бычья дивергенция (с RSI < 40) и подтверждающая свеча.")
                 return {"decision": "BUY", "signal_candle": signal_candle, "stop_loss_ref_candle": stop_loss_ref_candle, "type": "RSI_DIVERGENCE"}
+                
         self.log("Пропуск RSI divergence: Нет подтверждающей свечи после дивергенции."); return None
 
     def _find_entry_price_action_1h(self, market_data, key_levels):
@@ -431,9 +452,14 @@ class TradingBot(threading.Thread):
        if ind_1h is None or len(ind_1h) < 20: 
            self.log("Пропуск Price Action: Недостаточно данных 1H."); return None
        signal_candle, prev_candle = ind_1h.iloc[-1], ind_1h.iloc[-2]
+       
+       # --- УЛУЧШЕНИЕ: Добавляем Пин-бар ---
        is_hammer, is_engulfing = self._is_bullish_hammer(signal_candle), self._is_bullish_engulfing(prev_candle, signal_candle)
-       if not (is_hammer or is_engulfing): 
-           self.log("Пропуск Price Action: Нет бычьего паттерна."); return None
+       is_pin_bar = self._is_bullish_pin_bar(signal_candle)
+       
+       if not (is_hammer or is_engulfing or is_pin_bar): 
+           self.log("Пропуск Price Action: Нет бычьего паттерна (Hammer, Engulfing, Pin Bar)."); return None
+           
        try:
            rsi_1h = Decimal(str(signal_candle['RSI_14']))
            avg_volume = ind_1h['volume'].tail(10).mean()
@@ -442,16 +468,23 @@ class TradingBot(threading.Thread):
            atr_perc = (Decimal(str(signal_candle[f'ATRr_{self.atr_period}'])) / entry_price) * 100
        except (ValueError, KeyError):
             self.log("Пропуск Price Action: Ошибка данных RSI/Volume/ATR."); return None
-       if rsi_1h <= 40 or rsi_1h >= 70: 
-           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в диапазоне 40-70."); return None
+            
+       # --- УЛУЧШЕНИЕ: Сужаем диапазон RSI ---
+       if rsi_1h <= 30 or rsi_1h >= 65: 
+           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в диапазоне 30-65."); return None
+           
        is_near_support = any(abs(entry_price - support) / support < Decimal('0.02') for support in key_levels['supports'])
        if not is_near_support: 
            self.log("Пропуск Price Action: Цена не у поддержки."); return None
+           
        if signal_volume <= Decimal(str(avg_volume)): 
            self.log("Пропуск Price Action: Объем не выше среднего."); return None
+           
        if atr_perc > 3: 
            self.log("Пропуск Price Action: ATR > 3% (высокая волатильность)."); return None
-       self.log(f"    -> СИГНАЛ (Price Action 1H): Бычий паттерн ({'hammer' if is_hammer else 'engulfing'}), объем выше среднего, у поддержки.")
+           
+       pattern_type = "hammer" if is_hammer else ("engulfing" if is_engulfing else "pin_bar")
+       self.log(f"    -> СИГНАЛ (Price Action 1H): Бычий паттерн ({pattern_type}), объем выше среднего, у поддержки.")
        return {"decision": "BUY", "signal_candle": signal_candle, "type": "PRICE_ACTION"}
 
     def _find_entry_mean_reversion_4h(self, market_data):
@@ -460,22 +493,36 @@ class TradingBot(threading.Thread):
         if ind_4h is None or len(ind_4h) < (self.bb_len + 1):
             self.log("Пропуск Mean Reversion: Недостаточно данных 4H.")
             return None
-        signal_candle = ind_4h.iloc[-1]
+        
+        # --- УЛУЧШЕНИЕ: Нам нужна предыдущая свеча для проверки ---
+        prev_candle, signal_candle = ind_4h.iloc[-2], ind_4h.iloc[-1]
+        
         try:
             adx = Decimal(str(signal_candle[f'ADX_{self.adx_len}']))
             rsi = Decimal(str(signal_candle['RSI_14']))
-            close_price = Decimal(str(signal_candle['close']))
-            lower_bb = Decimal(str(signal_candle[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
+            
+            # --- УЛУЧШЕНИЕ: Логика "возврата в канал" ---
+            prev_close_price = Decimal(str(prev_candle['close']))
+            prev_lower_bb = Decimal(str(prev_candle[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
+            signal_close_price = Decimal(str(signal_candle['close']))
+            signal_lower_bb = Decimal(str(signal_candle[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
+
         except (ValueError, KeyError):
             self.log("Пропуск Mean Reversion: Ошибка данных ADX/BB/RSI.")
             return None
+            
         if adx >= 25:
             self.log(f"Пропуск Mean Reversion: ADX ({adx:.1f}) >= 25 (сильный тренд)."); return None
-        if rsi >= 40:
-            self.log(f"Пропуск Mean Reversion: RSI ({rsi:.1f}) >= 40."); return None
-        if close_price > lower_bb:
-            self.log(f"Пропуск Mean Reversion: Цена ({close_price}) > Lower BB ({lower_bb})."); return None
-        self.log(f"    -> СИГНАЛ (Mean Reversion 4H): ADX < 25, RSI < 40, Цена <= Lower BB.")
+            
+        # --- УЛУЧШЕНИЕ: RSI < 35 ---
+        if rsi >= 35:
+            self.log(f"Пропуск Mean Reversion: RSI ({rsi:.1f}) >= 35."); return None
+
+        # --- УЛУЧШЕНИЕ: Новая логика BB ---
+        if not (prev_close_price < prev_lower_bb and signal_close_price > signal_lower_bb):
+             self.log(f"Пропуск Mean Reversion: Нет подтвержденного возврата в канал BB."); return None
+
+        self.log(f"    -> СИГНАЛ (Mean Reversion 4H): ADX < 25, RSI < 35, Цена вернулась внутрь Lower BB.")
         return {"decision": "BUY", "signal_candle": signal_candle, "type": "MEAN_REVERSION"}
 
     def _find_entry_breakout_4h(self, market_data):
@@ -486,19 +533,32 @@ class TradingBot(threading.Thread):
         signal_candle = ind_4h.iloc[-1]
         try:
             adx = Decimal(str(signal_candle[f'ADX_{self.adx_len}']))
+            
+            # --- УЛУЧШЕНИЕ: Читаем DMP (DI+) и DMN (DI-) ---
+            dmp = Decimal(str(signal_candle[f'DMP_{self.adx_len}']))
+            dmn = Decimal(str(signal_candle[f'DMN_{self.adx_len}']))
+            
             close_price = Decimal(str(signal_candle['close']))
             upper_kc = Decimal(str(signal_candle[f'KCUe_{self.kc_len}_{self.kc_scalar}']))
             volume = Decimal(str(signal_candle['volume']))
             avg_volume = Decimal(str(signal_candle[f'VOL_SMA_{self.vol_sma_len}']))
         except (ValueError, KeyError):
-            self.log(f"Пропуск Breakout 4H: Ошибка данных ADX/KC/Volume. {signal_candle}"); return None
+            self.log(f"Пропуск Breakout 4H: Ошибка данных ADX/DI/KC/Volume. {signal_candle}"); return None
+            
         if adx <= 25:
             self.log(f"Пропуск Breakout 4H: ADX ({adx:.1f}) <= 25 (слабый тренд)."); return None
+            
+        # --- УЛУЧШЕНИЕ: Проверяем, что DI+ > DI- ---
+        if dmp <= dmn:
+            self.log(f"Пропуск Breakout 4H: Тренд не бычий (DMP: {dmp:.1f} <= DMN: {dmn:.1f})."); return None
+
         if close_price <= upper_kc:
             self.log(f"Пропуск Breakout 4H: Цена ({close_price}) не пробила Upper KC ({upper_kc})."); return None
+            
         if volume <= avg_volume:
             self.log(f"Пропуск Breakout 4H: Объем ({volume}) <= среднего ({avg_volume})."); return None
-        self.log(f"    -> СИГНАЛ (Breakout 4H): ADX > 25, Цена > Upper KC, Объем > SMA(20).")
+            
+        self.log(f"    -> СИГНАЛ (Breakout 4H): ADX > 25, DI+ > DI-, Цена > Upper KC, Объем > SMA(20).")
         return {"decision": "BUY", "signal_candle": signal_candle, "type": "BREAKOUT_4H"}
 
     def _find_entry_momentum_1h(self, market_data):
@@ -511,6 +571,10 @@ class TradingBot(threading.Thread):
         try:
             price_4h = Decimal(str(signal_4h['close']))
             ema_50_4h = Decimal(str(signal_4h[f'EMA_{self.ema_slow_len}']))
+            
+            # --- УЛУЧШЕНИЕ: Читаем 4H RSI ---
+            rsi_4h = Decimal(str(signal_4h['RSI_14']))
+            
             ema_9_1h = Decimal(str(signal_1h[f'EMA_{self.ema_superfast_len}']))
             ema_21_1h = Decimal(str(signal_1h[f'EMA_{self.ema_fast_len}']))
             rsi_1h = Decimal(str(signal_1h['RSI_14']))
@@ -520,21 +584,31 @@ class TradingBot(threading.Thread):
             stoch_d_prev_1h = Decimal(str(prev_1h['STOCHRSId_14_14_3_3']))
         except (ValueError, KeyError):
             self.log("Пропуск Momentum 1H: Ошибка данных EMA/RSI/StochRSI."); return None
+            
         if price_4h <= ema_50_4h:
             self.log(f"Пропуск Momentum 1H: 4H цена ({price_4h}) <= 4H EMA50 ({ema_50_4h})."); return None
+
+        # --- УЛУЧШЕНИЕ: Проверяем 4H RSI ---
+        if rsi_4h <= 50:
+            self.log(f"Пропуск Momentum 1H: 4H RSI ({rsi_4h:.1f}) <= 50."); return None
+
         if ema_9_1h <= ema_21_1h:
             self.log(f"Пропуск Momentum 1H: 1H EMA9 ({ema_9_1h}) <= 1H EMA21 ({ema_21_1h})."); return None
+            
         if rsi_1h <= 55:
             self.log(f"Пропуск Momentum 1H: 1H RSI ({rsi_1h}) <= 55."); return None
+            
         is_fresh_cross = stoch_k_prev_1h <= stoch_d_prev_1h and stoch_k_1h > stoch_d_1h
         is_rising_momentum = stoch_k_1h > stoch_d_1h and stoch_k_1h > stoch_k_prev_1h
         if not (is_fresh_cross or is_rising_momentum):
             self.log("Пропуск Momentum 1H: Нет сигнала StochRSI."); return None
-        self.log(f"    -> СИГНАЛ (Momentum 1H): 4H > EMA50, 1H EMA9 > 21, RSI > 55, StochRSI бычий.")
+            
+        self.log(f"    -> СИГНАЛ (Momentum 1H): 4H > EMA50, 4H RSI > 50, 1H EMA9 > 21, RSI > 55, StochRSI бычий.")
         return {"decision": "BUY", "signal_candle": signal_1h, "type": "MOMENTUM_1H"}
     
     # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ PA ---
     def _is_bullish_pin_bar(self, c):
+        # (Эта функция была в коде, но не использовалась. Теперь используется.)
         c_open, c_close, c_high, c_low = Decimal(str(c['open'])), Decimal(str(c['close'])), Decimal(str(c['high'])), Decimal(str(c['low']))
         body, rng = abs(c_close - c_open), c_high - c_low
         if body == 0 or rng == 0: return False
@@ -974,7 +1048,12 @@ class TradingBot(threading.Thread):
         for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col])
         df.ta.ema(length=self.ema_superfast_len, append=True); df.ta.ema(length=self.ema_fast_len, append=True); df.ta.ema(length=self.ema_slow_len, append=True); df.ta.ema(length=self.ema_trend_len, append=True)
         df.ta.rsi(length=14, append=True); df.ta.atr(length=self.atr_period, append=True); df.ta.stochrsi(append=True)
-        df.ta.adx(length=self.adx_len, append=True); df.ta.bbands(length=self.bb_len, std=self.bb_std, append=True); df.ta.kc(length=self.kc_len, scalar=self.kc_scalar, append=True)
+        
+        # --- ИЗМЕНЕНИЕ ---
+        # Убеждаемся, что adx() добавляет DMP и DMN для стратегии Breakout
+        df.ta.adx(length=self.adx_len, append=True)
+        
+        df.ta.bbands(length=self.bb_len, std=self.bb_std, append=True); df.ta.kc(length=self.kc_len, scalar=self.kc_scalar, append=True)
         df[f'VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['volume'], length=self.vol_sma_len)
         return df
     
