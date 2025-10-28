@@ -863,17 +863,27 @@ class TradingBot(threading.Thread):
 
         try:
             self.log(f"ИСПОЛНЕНИЕ ОРДЕРА (BUY, {self.current_trade_strategy_type}): {quantity} {self.base_asset} по рыночной цене...")
-            
-            # В бэктесте мы передаем 'entry_price', чтобы симулировать исполнение по этой цене
-            trigger_price = entry_price if self.is_backtest else None
-            
-            order_result = self.binance_client.create_order(
-                symbol=self.symbol, 
-                side=Client.SIDE_BUY, 
-                type=Client.ORDER_TYPE_MARKET, 
-                quantity=float(quantity), 
-                trigger_price=trigger_price # Используется только в mock-клиенте
-            )
+
+            # --- ИЗМЕНЕНИЕ: Разделяем логику Live и Backtest ---
+            if self.is_backtest:
+                # В бэктесте мы передаем 'entry_price', чтобы симулировать исполнение по этой цене
+                trigger_price = entry_price
+                order_result = self.binance_client.create_order(
+                    symbol=self.symbol,
+                    side=Client.SIDE_BUY,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=float(quantity),
+                    trigger_price=trigger_price
+                )
+            else:
+                # В РЕАЛЬНОЙ ТОРГОВЛЕ 'trigger_price' НЕ используется для MARKET ордеров
+                order_result = self.binance_client.create_order(
+                    symbol=self.symbol,
+                    side=Client.SIDE_BUY,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=float(quantity)
+                )
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             
             self._process_filled_order(order_result, "SWING OPEN")
             self.position_side, self.stop_loss_price = 'LONG', stop_loss_price
@@ -993,7 +1003,6 @@ class TradingBot(threading.Thread):
             self.log(f"{log_type}: Цена={current_price:.{self.price_precision}f}, SL={self.stop_loss_price:.{self.price_precision}f}, TP={log_tp}")
 
     def _close_position(self, reason="", is_partial=False, partial_ratio=0.5, execution_price=None):
-        # (Эта функция без изменений)
         if not self.position_side: return
         qty_to_sell = (self.quantity * Decimal(str(partial_ratio))) if is_partial else self.quantity
         if qty_to_sell <= 0: return
@@ -1021,22 +1030,22 @@ class TradingBot(threading.Thread):
             log_prefix = "ЧАСТИЧНОЕ ЗАКРЫТИЕ" if is_partial else "ПОЛНОЕ ЗАКРЫТИЕ"
             self.log(f"ЗАПУСК {log_prefix}. Причина: {reason}.")
             
-            # --- ИСПРАВЛЕННЫЙ ВЫЗОВ ---
-            # Параметр trigger_price УДАЛЕН, так как он несовместим с ORDER_TYPE_MARKET
-            order = self.binance_client.create_order(
-                symbol=self.symbol, 
-                side=Client.SIDE_SELL, 
-                type=Client.ORDER_TYPE_MARKET, 
-                quantity=float(qty_to_sell)
-            )
-            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-            
-            # В бэктесте мы передаем execution_price в mock-обработчик
+            # --- ИЗМЕНЕНИЕ: Убираем дублирование и разделяем логику ---
             if self.is_backtest:
+                # В бэктесте мы передаем execution_price в mock-обработчик
                 order = self.binance_client.create_order(
-                    symbol=self.symbol, side=Client.SIDE_SELL, type=Client.ORDER_TYPE_MARKET, 
+                    symbol=self.symbol, side=Client.SIDE_SELL, type=Client.ORDER_TYPE_MARKET,
                     quantity=float(qty_to_sell), trigger_price=execution_price
                 )
+            else:
+                # В РЕАЛЬНОЙ ТОРГОВЛЕ 'trigger_price' НЕ используется
+                order = self.binance_client.create_order(
+                    symbol=self.symbol,
+                    side=Client.SIDE_SELL,
+                    type=Client.ORDER_TYPE_MARKET,
+                    quantity=float(qty_to_sell)
+                )
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             self._process_filled_order(order, f"CLOSE {self.position_side}", is_partial)
             
@@ -1052,7 +1061,6 @@ class TradingBot(threading.Thread):
             if not is_partial: self._reset_position_state(); self._save_state()
     
     def _process_filled_order(self, order, order_type_str, is_partial=False):
-        # (Эта функция без изменений)
         if not order or not order.get('fills'): self.log("Ордер не содержит информации об исполнении."); return
         fills = order['fills']; total_qty = sum(Decimal(f['qty']) for f in fills); total_cost = sum(Decimal(f['qty']) * Decimal(f['price']) for f in fills); total_comm = sum(Decimal(f['commission']) for f in fills)
         avg_price = total_cost / total_qty if total_qty > 0 else Decimal('0'); comm_usdt = self._convert_commission_to_usdt(total_comm, fills[0]['commissionAsset'])
@@ -1074,8 +1082,25 @@ class TradingBot(threading.Thread):
                 if self.current_trade_pnl > 0: self.win_trades += 1; self.wins_by_strategy[stype] += 1
                 else: self.loss_trades += 1; self.losses_by_strategy[stype] += 1
                 self.log(f"ИТОГ СДЕЛКИ ({stype}): PnL: ${self.current_trade_pnl:.2f}, Комиссии: ${comm_usdt + commission_to_attribute:.2f}")
-            trade_update_info = {'trade_id': self.current_trade_id, 'strategy': stype, 'exit_time': self._get_current_time().strftime('%y-%m-%d %H:%M'), 'exit_price': f"{avg_price:.{self.price_precision}f}", 'pnl': f"{net_pnl:.2f}", 'is_partial': is_partial}
+
+            # --- ИЗМЕНЕНИЕ: Отправляем оставшееся кол-во в GUI ---
+            # self.quantity здесь - это кол-во ДО продажи
+            # total_qty - это кол-во, которое было продано
+            remaining_qty_val = self.quantity - total_qty
+            if not is_partial:
+                remaining_qty_val = Decimal('0.0') # Если закрытие полное
+            
+            trade_update_info = {
+                'trade_id': self.current_trade_id,
+                'strategy': stype,
+                'exit_time': self._get_current_time().strftime('%y-%m-%d %H:%M'),
+                'exit_price': f"{avg_price:.{self.price_precision}f}",
+                'pnl': f"{net_pnl:.2f}",
+                'is_partial': is_partial,
+                'remaining_quantity': f"{remaining_qty_val:.{self.qty_precision}f}" # <-- НОВЫЙ ПАРАМЕТР
+            }
             self._update_trade_in_history_gui(trade_update_info)
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     
     def _reset_position_state(self):
         # (Эта функция без изменений)
