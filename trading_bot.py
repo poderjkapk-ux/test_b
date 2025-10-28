@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 getcontext().prec = 18
 
 # --- ПРОВЕРКА И ИМПОРТ БИБЛИОТЕК ---
-# (Основная проверка в main.py, здесь импортируем)
 try:
     from binance.client import Client
     from binance.exceptions import BinanceAPIException, BinanceRequestException
@@ -27,24 +26,23 @@ try:
     import pandas_ta as ta
 except ImportError:
     logger.critical("КРИТИЧЕСКАЯ ОШИБКА: trading_bot.py не смог импортировать 'binance', 'pandas' или 'pandas_ta'. Убедитесь, что main.py был запущен и библиотеки установлены.")
-    # Не вызываем exit(), чтобы не прервать главный поток, если он существует
     pass 
 
 # --- Файл для сохранения состояния бота ---
 STATE_FILE = "bot_state_multi_strategy.json"
 
 
-# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v8.6 Configurable) ---
+# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v8.7 Smart Prioritization) ---
 class TradingBot(threading.Thread):
     
-    # *** ИЗМЕНЕНО: Добавлен 'active_strategies_config' ***
     def __init__(self, api_key, api_secret, event_queue, risk_per_trade, rr_ratio, symbol, active_strategies_config, backtest_client=None):
         super().__init__()
         self.daemon = True
         self.api_key, self.api_secret, self.event_queue = api_key, api_secret, event_queue
         try:
             self.base_risk_per_trade = Decimal(str(risk_per_trade)) / 100
-            self.base_rr_ratio = Decimal(str(rr_ratio))
+            # --- ИЗМЕНЕНО: Базовый R/R теперь - это МИНИМАЛЬНО допустимый R/R ---
+            self.base_rr_ratio = Decimal(str(rr_ratio)) 
         except (ValueError, TypeError):
             self.log("Ошибка: риск и R/R должны быть числами. Используются значения по умолчанию.")
             self.base_risk_per_trade = Decimal('0.01')
@@ -57,7 +55,6 @@ class TradingBot(threading.Thread):
         if self.is_backtest:
             backtest_client.log_callback = self.log
 
-        # *** НОВОЕ: Конфигурация активных стратегий ***
         self.active_strategies = active_strategies_config
         self.log(f"Активные стратегии: {[stype for stype, active in self.active_strategies.items() if active]}")
 
@@ -105,7 +102,7 @@ class TradingBot(threading.Thread):
         # --- Параметры индикаторов ---
         self.ema_superfast_len, self.ema_fast_len, self.ema_slow_len, self.ema_trend_len = 9, 21, 50, 200
         self.atr_period = 14 
-        self.atr_multiplier_sl = Decimal('1.5')
+        self.atr_multiplier_sl = Decimal('1.5') # Множитель ATR для SL по умолчанию
         self.atr_multiplier_trail = Decimal('2.0')
         self.bb_len, self.bb_std = 20, 2.0
         self.kc_len, self.kc_scalar = 20, 2.0
@@ -116,8 +113,7 @@ class TradingBot(threading.Thread):
         self.last_hour_checked = None
 
     def _save_state(self):
-        # (Эта функция без изменений. Мы не сохраняем *конфигурацию* (галочки),
-        # но продолжаем сохранять *статистику* и *текущее состояние*.)
+        # (Эта функция без изменений)
         if self.is_backtest: return
         pnl_by_strategy_str = {k: str(v) for k, v in self.pnl_by_strategy.items()}
         state = {
@@ -186,7 +182,7 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"ОШИБКА: Не удалось загрузить состояние бота: {e}")
 
     def run(self):
-        bot_name = "Multi-Strategy Trader v8.6 (Configurable)"
+        bot_name = "Multi-Strategy Trader v8.7 (Smart Prioritization)" # --- ИЗМЕНЕНО ---
         mode = "БЭКТЕСТ (1M)" if self.is_backtest else "РЕАЛЬНАЯ ТОРГОВЛЯ" 
         self.log(f"Запуск бота '{bot_name}' в режиме '{mode}' для символа {self.symbol}...")
         
@@ -230,6 +226,7 @@ class TradingBot(threading.Thread):
                          self.log(f"--- Новая 1H свеча ({current_time_dt.strftime('%Y-%m-%d %H:%M')}). Запуск анализа... ---")
                 
                 if self.position_side:
+                    # --- ИЗМЕНЕНО: Передаем 'market_data' для управления SL по RSI ---
                     self._check_and_manage_exit_conditions(market_data, current_price, current_high, current_low, current_1m_candle) 
                 else:
                     if should_check_logic: 
@@ -240,16 +237,20 @@ class TradingBot(threading.Thread):
                             if self.is_backtest: self.log("Баланс USDT исчерпан. Бэктест остановлен."); break
                             self.log(f"Торговля приостановлена. Недостаточно средств."); self._wait_or_continue(300); continue
                         
-                        # *** ИЗМЕНЕНО: Вызов _get_algorithmic_decision (сама функция тоже изменена) ***
-                        decision = self._get_algorithmic_decision(market_data)
-                        if decision:
-                            self._calculate_and_open_position(decision, market_data)
+                        # --- ИЗМЕНЕНО: Вызов _get_algorithmic_decision (сама функция тоже изменена) ---
+                        # --- ИЗМЕНЕНО: Теперь передаем current_price для более точных расчетов R:R ---
+                        best_signal = self._get_algorithmic_decision(market_data, current_price)
+                        
+                        if best_signal:
+                            # --- ИЗМЕНЕНО: _calculate_and_open_position теперь принимает 'best_signal' ---
+                            self._calculate_and_open_position(best_signal, market_data)
                         else:
                             if self.is_backtest or not self.is_backtest: 
-                                self.log("Анализ завершен: Нет сигнала для входа.")
+                                self.log("Анализ завершен: Нет сигналов, соответствующих мин. R/R.")
                     
                 if not self.is_backtest and time.time() - self.last_log_time > 300:
                     self._log_detailed_status(market_data); self.last_log_time = time.time()
+            
             except (BinanceRequestException, requests.exceptions.RequestException) as e: 
                 self.log(f"Сетевая ошибка: {e}. Активация режима переподключения."); self.is_connected = False
                 time.sleep(2 ** min(self.reconnect_attempts, 5)); self.reconnect_attempts += 1
@@ -257,7 +258,9 @@ class TradingBot(threading.Thread):
                 self.log(f"Ошибка API Binance: {e}. Код: {e.code}, Сообщение: {e.message}"); self._sleep_interruptible(60)
             except Exception as e:
                 self.log(f"НЕОЖИДАННАЯ ОШИБКА в главном цикле: {e}. Попытка продолжить через 60 секунд."); logger.exception("Детали:"); self._sleep_interruptible(60)
+            
             self._wait_or_continue(); tick_counter += 1
+            
         self._finalize_run()
 
     def _log_detailed_status(self, market_data):
@@ -280,8 +283,10 @@ class TradingBot(threading.Thread):
             status_msg += "  - Нет открытой позиции. Ожидание сигналов.\n"
         self.log(status_msg)
 
-    # *** ИЗМЕНЕНО: Добавлена проверка 'self.active_strategies' ***
-    def _get_algorithmic_decision(self, market_data):
+    # ---
+    # --- ИЗМЕНЕНО: ГЛАВНАЯ ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ ---
+    # ---
+    def _get_algorithmic_decision(self, market_data, current_price):
         # --- 1. Глобальный фильтр (1D) (без изменений) ---
         ind_1d = market_data.get('indicators_1d')
         if ind_1d is None or len(ind_1d) < self.ema_trend_len:
@@ -316,7 +321,7 @@ class TradingBot(threading.Thread):
                     self.log("Предупреждение: NaN в данных корреляции. Пропуск проверки.")
                 else:
                     correlation = np.corrcoef(symbol_closes, btc_closes)[0, 1]
-                    btc_change = (btc_price_1d - Decimal(str(ind_1d_btc.iloc[-2]['close']))) / Decimal(str(ind_1d_btc.iloc[-2]['close']))
+                    btc_change = (btc_price_1d - Decimal(str(ind_1d.iloc[-2]['close']))) / Decimal(str(ind_1d.iloc[-2]['close']))
                     if correlation > 0.8 and btc_change < 0:
                         reason = f"Корреляция с BTC > 0.8 ({correlation:.2f}) и BTC падает ({btc_change:.2%}). Покупки запрещены."
                         self._log_daily_status(reason); return None
@@ -325,40 +330,60 @@ class TradingBot(threading.Thread):
         
         self._log_daily_status("Рынок бычий (Цена > 1D EMA200). Поиск сигналов...")
 
-        # --- 2. Поиск сигналов по АКТИВНЫМ стратегиям ---
+        # --- 2. НОВАЯ ЛОГИКА: Сбор и Приоритезация Сигналов ---
+        all_potential_signals = []
         key_levels = self._get_key_levels(market_data['indicators_4h'])
-        
+
         # --- Стратегия 1: Mean Reversion ---
         if self.active_strategies.get("MEAN_REVERSION", False):
-            decision = self._find_entry_mean_reversion_4h(market_data)
-            if decision: return decision
+            signal = self._find_entry_mean_reversion_4h(market_data, current_price)
+            if signal: all_potential_signals.append(signal)
 
-        # --- Стратегия 2: Breakout ---
+        # --- Стратегия 2: Breakout & Retest ---
         if self.active_strategies.get("BREAKOUT_4H", False):
-            decision = self._find_entry_breakout_4h(market_data)
-            if decision: return decision
+            signal = self._find_entry_breakout_retest_4h(market_data, current_price)
+            if signal: all_potential_signals.append(signal)
 
-        # --- Стратегия 3: Momentum ---
+        # --- Стратегия 3: Momentum Pullback ---
         if self.active_strategies.get("MOMENTUM_1H", False):
-            decision = self._find_entry_momentum_1h(market_data)
-            if decision: return decision
+            signal = self._find_entry_momentum_pullback_1h(market_data, current_price)
+            if signal: all_potential_signals.append(signal)
 
         # --- Стратегия 4: Swing (RSI Дивергенция) ---
         if self.active_strategies.get("RSI_DIVERGENCE", False):
-            decision = self._find_entry_rsi_divergence_4h(market_data, key_levels)
-            if decision: return decision
+            signal = self._find_entry_rsi_divergence_4h(market_data, current_price)
+            if signal: all_potential_signals.append(signal)
 
         # --- Стратегия 5: Swing (Price Action) ---
         if self.active_strategies.get("PRICE_ACTION", False):
-            decision = self._find_entry_price_action_1h(market_data, key_levels)
-            if decision: return decision
+            signal = self._find_entry_price_action_1h(market_data, current_price, key_levels)
+            if signal: all_potential_signals.append(signal)
         
-        # --- Стратегия 6: Swing (EMA Cross) ---
+        # --- Стратегия 6: Swing (EMA Pullback) ---
         if self.active_strategies.get("EMA_CROSS", False):
-            decision = self._find_entry_ema_cross_4h(market_data, key_levels)
-            if decision: return decision
+            signal = self._find_entry_ema_pullback_4h(market_data, current_price, key_levels)
+            if signal: all_potential_signals.append(signal)
 
-        return None
+        # --- 3. ВЫБОР ЛУЧШЕГО СИГНАЛА ---
+        if not all_potential_signals:
+            return None # Нет сигналов
+
+        # Сортируем все найденные сигналы по R:R (от лучшего к худшему)
+        sorted_signals = sorted(all_potential_signals, key=lambda x: x.get('rr_ratio', Decimal('0.0')), reverse=True)
+        
+        # Логируем все найденные сигналы для отладки
+        for s in sorted_signals:
+             self.log(f"    -> КАНДИДАТ: {s['type']} (Расчетный R/R: {s['rr_ratio']:.2f}:1)")
+
+        best_signal = sorted_signals[0]
+        
+        # Выбираем лучший, только если он соответствует нашему МИНИМАЛЬНОМУ R/R
+        if best_signal['rr_ratio'] >= self.base_rr_ratio:
+            self.log(f"    -> ✅ ВЫБОР ЛУЧШЕГО СИГНАЛА: {best_signal['type']} (R/R: {best_signal['rr_ratio']:.2f}:1)")
+            return best_signal
+        else:
+            self.log(f"    -> СИГНАЛЫ ОТКЛОНЕНЫ: Лучший R/R ({best_signal['rr_ratio']:.2f}:1) < минимального ({self.base_rr_ratio}:1)")
+            return None
     
     def _get_key_levels(self, ind_4h):
         # (без изменений)
@@ -367,248 +392,364 @@ class TradingBot(threading.Thread):
         recent_data = ind_4h.iloc[-60:]
         supports = recent_data[(recent_data['low'] < recent_data['low'].shift(1)) & (recent_data['low'] < recent_data['low'].shift(-1))]
         resistances = recent_data[(recent_data['high'] > recent_data['high'].shift(1)) & (recent_data['high'] > recent_data['high'].shift(-1))]
-        levels['supports'] = [Decimal(str(s_val)) for s_val in supports['low'].values]
-        levels['resistances'] = [Decimal(str(r_val)) for r_val in resistances['high'].values]
+        levels['supports'] = sorted([Decimal(str(s_val)) for s_val in supports['low'].values], reverse=True) # Сортируем (от ближнего к дальнему)
+        levels['resistances'] = sorted([Decimal(str(r_val)) for r_val in resistances['high'].values]) # Сортируем (от ближнего к дальнему)
         return levels
 
-    def _find_entry_ema_cross_4h(self, market_data, key_levels):
-        # (без изменений)
+    # ---
+    # --- ИЗМЕНЕННЫЕ СТРАТЕГИИ ---
+    # ---
+
+    # --- СТРАТЕГИЯ 6 (ИЗМЕНЕНО): EMA Pullback (Откат к EMA) ---
+    def _find_entry_ema_pullback_4h(self, market_data, current_price, key_levels):
         ind_4h = market_data.get('indicators_4h')
-        if ind_4h is None or len(ind_4h) < self.ema_slow_len: 
-            self.log("Пропуск EMA cross: Недостаточно данных 4H.")
+        ind_1h = market_data.get('indicators_1h')
+        if ind_4h is None or ind_1h is None or len(ind_4h) < self.ema_slow_len or len(ind_1h) < 2:
             return None
-        prev_candle, signal_candle = ind_4h.iloc[-2], ind_4h.iloc[-1]
+        
+        last_4h = ind_4h.iloc[-1]
         try:
-            ema9_prev = Decimal(str(prev_candle[f'EMA_{self.ema_superfast_len}']))
-            ema21_prev = Decimal(str(prev_candle[f'EMA_{self.ema_fast_len}']))
-            ema9_signal = Decimal(str(signal_candle[f'EMA_{self.ema_superfast_len}']))
-            ema21_signal = Decimal(str(signal_candle[f'EMA_{self.ema_fast_len}']))
-            
-            # --- УЛУЧШЕНИЕ: Добавляем EMA 50 для фильтра ---
-            ema50_signal = Decimal(str(signal_candle[f'EMA_{self.ema_slow_len}']))
-            
-            rsi_signal = Decimal(str(signal_candle['RSI_14']))
+            ema9_4h = Decimal(str(last_4h[f'EMA_{self.ema_superfast_len}']))
+            ema21_4h = Decimal(str(last_4h[f'EMA_{self.ema_fast_len}']))
+            ema50_4h = Decimal(str(last_4h[f'EMA_{self.ema_slow_len}']))
+            atr_4h = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
         except (ValueError, KeyError):
-            self.log("Пропуск EMA cross: Недопустимые значения EMA/RSI.")
             return None
             
-        if not (ema9_prev < ema21_prev and ema9_signal > ema21_signal): 
-            self.log("Пропуск EMA cross: Нет пересечения EMA 9/21."); return None
+        # 1. Тренд должен быть бычьим и устоявшимся
+        if not (ema9_4h > ema21_4h and ema21_4h > ema50_4h):
+            self.log("Пропуск EMA Pullback: 4H EMAs не в бычьем порядке (9 > 21 > 50)."); return None
 
-        # --- УЛУЧШЕНИЕ: Пересечение должно быть выше EMA 50 ---
-        if ema21_signal < ema50_signal:
-            self.log(f"Пропуск EMA cross: Пересечение ниже EMA 50 (EMA21: {ema21_signal:.2f} < EMA50: {ema50_signal:.2f})."); return None
+        # 2. Цена должна быть в зоне отката (между EMA 9 и EMA 50)
+        if not (ema50_4h < current_price < ema9_4h):
+             self.log(f"Пропуск EMA Pullback: Цена ({current_price}) не в зоне отката (между {ema9_4h:.2f} и {ema50_4h:.2f})."); return None
 
-        if rsi_signal < 50: 
-            self.log(f"Пропуск EMA cross: RSI ({rsi_signal:.1f}) < 50."); return None
+        # 3. Ищем 1H бычий паттерн для входа
+        signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
+        is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
+        if not (is_hammer or is_engulfing):
+            self.log("Пропуск EMA Pullback: Нет 1H паттерна (Hammer/Engulfing) на 4H уровне."); return None
             
-        entry_price = market_data['current_price']
-        is_near_support = any(abs(entry_price - support) / support < Decimal('0.01') for support in key_levels['supports'])
-        if not is_near_support: 
-            self.log("Пропуск EMA cross: Цена не у поддержки."); return None
-            
-        self.log(f"    -> СИГНАЛ (EMA Cross 4H): EMA 9/21 пересеклись, RSI ({rsi_signal:.1f}) > 50, цена у поддержки, EMA21 > EMA50.")
-        return {"decision": "BUY", "signal_candle": signal_candle, "type": "EMA_CROSS"}
+        # 4. Расчет R:R
+        entry_price = current_price
+        # SL: Чуть ниже 4H EMA 50 (самая сильная поддержка)
+        stop_loss_price = self._round_price(ema50_4h - (atr_4h * Decimal('0.5'))) 
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: Ближайший 4H уровень сопротивления
+        target_tp = self._get_next_resistance(key_levels, entry_price)
+        if not target_tp: 
+             self.log("Пропуск EMA Pullback: Не найден уровень сопротивления для TP."); return None
+             
+        reward_per_coin = target_tp - entry_price
+        if reward_per_coin <= 0: return None
+        
+        rr_ratio = reward_per_coin / risk_per_coin
+        
+        self.log(f"    -> Кандидат (EMA Pullback): 1H паттерн на 4H EMA. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {
+            "type": "EMA_CROSS", # Оставляем старый тип для статистики
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "final_take_profit_price": target_tp,
+            "rr_ratio": rr_ratio
+        }
 
-    def _find_entry_rsi_divergence_4h(self, market_data, key_levels):
-        # (без изменений)
+    # --- СТРАТЕГИЯ 4 (ИЗМЕНЕНО): RSI Divergence (с 1H подтверждением) ---
+    def _find_entry_rsi_divergence_4h(self, market_data, current_price):
         ind_4h = market_data.get('indicators_4h')
-        if ind_4h is None or len(ind_4h) < 40: 
-            self.log("Пропуск RSI divergence: Недостаточно данных 4H."); return None
+        ind_1h = market_data.get('indicators_1h')
+        if ind_4h is None or ind_1h is None or len(ind_4h) < 40 or len(ind_1h) < 2:
+            return None
+        
         lookback_period = 30
         recent_data = ind_4h.iloc[-lookback_period:]
         rsi_lows = recent_data[(recent_data['RSI_14'] < recent_data['RSI_14'].shift(1)) & (recent_data['RSI_14'] < recent_data['RSI_14'].shift(-1))]
-        if len(rsi_lows) < 2: 
-            self.log("Пропуск RSI divergence: Менее 2 минимумов RSI."); return None
+        if len(rsi_lows) < 2: return None
             
         last_rsi_low_val, prev_rsi_low_val = rsi_lows.iloc[-1]['RSI_14'], rsi_lows.iloc[-2]['RSI_14']
         last_rsi_low_idx, prev_rsi_low_idx = rsi_lows.index[-1], rsi_lows.index[-2]
 
-        # --- УЛУЧШЕНИЕ: Первый минимум должен быть в зоне < 40 ---
-        if not (prev_rsi_low_val < 40):
-            self.log(f"Пропуск RSI divergence: Первый минимум RSI ({prev_rsi_low_val:.1f}) не находится в зоне < 40."); return None
-
-        if not (last_rsi_low_val > prev_rsi_low_val): 
-            self.log("Пропуск RSI divergence: Нет более высокого минимума RSI."); return None
-            
+        # 1. Первый минимум RSI < 40
+        if not (prev_rsi_low_val < 40): return None
+        # 2. Второй минимум RSI > первого (RSI растет)
+        if not (last_rsi_low_val > prev_rsi_low_val): return None
+        # 3. Цена на втором минимуме < цены на первом (Цена падает)
         price_at_last_rsi_low, price_at_prev_rsi_low = recent_data.loc[last_rsi_low_idx]['low'], recent_data.loc[prev_rsi_low_idx]['low']
-        if not (price_at_last_rsi_low < price_at_prev_rsi_low): 
-            self.log("Пропуск RSI divergence: Нет более низкого минимума цены."); return None
+        if not (price_at_last_rsi_low < price_at_prev_rsi_low): return None
             
-        data_after_divergence = recent_data.loc[last_rsi_low_idx:]
-        confirmation_high = data_after_divergence.iloc[0]['high']
-        for i in range(1, len(data_after_divergence)):
-            if data_after_divergence.iloc[i]['close'] > confirmation_high:
-                signal_candle = data_after_divergence.iloc[i]
-                stop_loss_ref_candle = data_after_divergence.iloc[0]
-                self.log(f"    -> СИГНАЛ (RSI Divergence 4H): Найдена бычья дивергенция (с RSI < 40) и подтверждающая свеча.")
-                return {"decision": "BUY", "signal_candle": signal_candle, "stop_loss_ref_candle": stop_loss_ref_candle, "type": "RSI_DIVERGENCE"}
-                
-        self.log("Пропуск RSI divergence: Нет подтверждающей свечи после дивергенции."); return None
+        # 4. Ищем 1H паттерн (раннее подтверждение)
+        signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
+        is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
+        
+        # Дивергенция должна была случиться недавно (на последних 3-х 4H свечах)
+        is_recent_divergence = (ind_4h.index[-1] - last_rsi_low_idx) <= 3
+        
+        if not ((is_hammer or is_engulfing) and is_recent_divergence):
+             self.log(f"Пропуск RSI Div: Дивергенция найдена, но нет 1H паттерна (Hammer/Engulfing) для входа."); return None
+            
+        # 5. Расчет R:R
+        entry_price = current_price
+        # SL: Под абсолютным минимумом дивергенции + ATR
+        stop_loss_ref_candle = recent_data.loc[last_rsi_low_idx]
+        atr_4h = Decimal(str(stop_loss_ref_candle[f'ATRr_{self.atr_period}']))
+        stop_loss_price = self._round_price(Decimal(str(stop_loss_ref_candle['low'])) - (atr_4h * Decimal('0.5')))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
 
-    def _find_entry_price_action_1h(self, market_data, key_levels):
-        # (без изменений)
+        # TP: Уровень High первого минимума дивергенции
+        target_tp = self._round_price(Decimal(str(recent_data.loc[prev_rsi_low_idx]['high'])))
+        reward_per_coin = target_tp - entry_price
+        if reward_per_coin <= 0: return None
+        
+        rr_ratio = reward_per_coin / risk_per_coin
+
+        self.log(f"    -> Кандидат (RSI Divergence): 4H дивергенция + 1H PA. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {
+            "type": "RSI_DIVERGENCE",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "final_take_profit_price": target_tp,
+            "rr_ratio": rr_ratio
+        }
+
+    # --- СТРАТЕГИЯ 5 (ИЗМЕНЕНО): Price Action (PA 1H) ---
+    def _find_entry_price_action_1h(self, market_data, current_price, key_levels):
        ind_1h = market_data.get('indicators_1h')
-       if ind_1h is None or len(ind_1h) < 20: 
-           self.log("Пропуск Price Action: Недостаточно данных 1H."); return None
+       if ind_1h is None or len(ind_1h) < 20: return None
+       
        signal_candle, prev_candle = ind_1h.iloc[-1], ind_1h.iloc[-2]
        
-       # --- УЛУЧШЕНИЕ: Добавляем Пин-бар ---
+       # 1. Ищем бычий паттерн
        is_hammer, is_engulfing = self._is_bullish_hammer(signal_candle), self._is_bullish_engulfing(prev_candle, signal_candle)
        is_pin_bar = self._is_bullish_pin_bar(signal_candle)
-       
-       if not (is_hammer or is_engulfing or is_pin_bar): 
-           self.log("Пропуск Price Action: Нет бычьего паттерна (Hammer, Engulfing, Pin Bar)."); return None
+       if not (is_hammer or is_engulfing or is_pin_bar): return None
            
        try:
            rsi_1h = Decimal(str(signal_candle['RSI_14']))
            avg_volume = ind_1h['volume'].tail(10).mean()
            signal_volume = Decimal(str(signal_candle['volume']))
-           entry_price = market_data['current_price']
-           atr_perc = (Decimal(str(signal_candle[f'ATRr_{self.atr_period}'])) / entry_price) * 100
+           atr_1h = Decimal(str(signal_candle[f'ATRr_{self.atr_period}']))
        except (ValueError, KeyError):
             self.log("Пропуск Price Action: Ошибка данных RSI/Volume/ATR."); return None
             
-       # --- УЛУЧШЕНИЕ: Сужаем диапазон RSI ---
-       if rsi_1h <= 30 or rsi_1h >= 65: 
-           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в диапазоне 30-65."); return None
+       # 2. ИЗМЕНЕННЫЙ ФИЛЬТР: RSI должен быть < 40 (зона перепроданности)
+       if rsi_1h >= 40: 
+           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в зоне < 40."); return None
            
-       is_near_support = any(abs(entry_price - support) / support < Decimal('0.02') for support in key_levels['supports'])
+       # 3. Цена у 4H поддержки
+       is_near_support = any(abs(current_price - support) / support < Decimal('0.015') for support in key_levels['supports'])
        if not is_near_support: 
-           self.log("Пропуск Price Action: Цена не у поддержки."); return None
+           self.log("Пропуск Price Action: Цена не у 4H поддержки."); return None
            
+       # 4. Объем выше среднего
        if signal_volume <= Decimal(str(avg_volume)): 
            self.log("Пропуск Price Action: Объем не выше среднего."); return None
            
-       if atr_perc > 3: 
-           self.log("Пропуск Price Action: ATR > 3% (высокая волатильность)."); return None
-           
+       # 5. Расчет R:R
+       entry_price = current_price
+       stop_loss_price = self._round_price(Decimal(str(signal_candle['low'])) - (atr_1h * Decimal('0.2')))
+       risk_per_coin = entry_price - stop_loss_price
+       if risk_per_coin <= 0: return None
+       
+       # TP: Ближайший 4H уровень сопротивления
+       target_tp = self._get_next_resistance(key_levels, entry_price)
+       if not target_tp: 
+            self.log("Пропуск Price Action: Не найден уровень сопротивления для TP."); return None
+            
+       reward_per_coin = target_tp - entry_price
+       if reward_per_coin <= 0: return None
+       
+       rr_ratio = reward_per_coin / risk_per_coin
        pattern_type = "hammer" if is_hammer else ("engulfing" if is_engulfing else "pin_bar")
-       self.log(f"    -> СИГНАЛ (Price Action 1H): Бычий паттерн ({pattern_type}), объем выше среднего, у поддержки.")
-       return {"decision": "BUY", "signal_candle": signal_candle, "type": "PRICE_ACTION"}
+       
+       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type}, RSI < 40, у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+       return {
+            "type": "PRICE_ACTION",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "final_take_profit_price": target_tp,
+            "rr_ratio": rr_ratio
+       }
 
-    def _find_entry_mean_reversion_4h(self, market_data):
-        # (без изменений)
+    # --- СТРАТЕГИЯ 1 (ИЗМЕНЕНО): Mean Reversion (BB 4H) ---
+    def _find_entry_mean_reversion_4h(self, market_data, current_price):
         ind_4h = market_data.get('indicators_4h')
-        if ind_4h is None or len(ind_4h) < (self.bb_len + 1):
-            self.log("Пропуск Mean Reversion: Недостаточно данных 4H.")
-            return None
+        if ind_4h is None or len(ind_4h) < (self.bb_len + 1): return None
         
-        # --- УЛУЧШЕНИЕ: Нам нужна предыдущая свеча для проверки ---
-        prev_candle, signal_candle = ind_4h.iloc[-2], ind_4h.iloc[-1]
-        
+        last_4h = ind_4h.iloc[-1]
         try:
-            adx = Decimal(str(signal_candle[f'ADX_{self.adx_len}']))
-            rsi = Decimal(str(signal_candle['RSI_14']))
-            
-            # --- УЛУЧШЕНИЕ: Логика "возврата в канал" ---
-            prev_close_price = Decimal(str(prev_candle['close']))
-            prev_lower_bb = Decimal(str(prev_candle[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
-            signal_close_price = Decimal(str(signal_candle['close']))
-            signal_lower_bb = Decimal(str(signal_candle[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
-
+            adx = Decimal(str(last_4h[f'ADX_{self.adx_len}']))
+            rsi = Decimal(str(last_4h['RSI_14']))
+            low_price = Decimal(str(last_4h['low']))
+            lower_bb = Decimal(str(last_4h[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
+            middle_bb = Decimal(str(last_4h[f'BBM_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
+            atr_4h = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
         except (ValueError, KeyError):
-            self.log("Пропуск Mean Reversion: Ошибка данных ADX/BB/RSI.")
-            return None
+            self.log("Пропуск Mean Reversion: Ошибка данных ADX/BB/RSI."); return None
             
+        # 1. Ищем флэт (ADX < 25)
         if adx >= 25:
             self.log(f"Пропуск Mean Reversion: ADX ({adx:.1f}) >= 25 (сильный тренд)."); return None
             
-        # --- УЛУЧШЕНИЕ: RSI < 35 ---
-        if rsi >= 35:
-            self.log(f"Пропуск Mean Reversion: RSI ({rsi:.1f}) >= 35."); return None
+        # 2. ИЗМЕНЕНО: Ищем реальную перепроданность (RSI < 30)
+        if rsi >= 30:
+            self.log(f"Пропуск Mean Reversion: RSI ({rsi:.1f}) >= 30."); return None
 
-        # --- УЛУЧШЕНИЕ: Новая логика BB ---
-        if not (prev_close_price < prev_lower_bb and signal_close_price > signal_lower_bb):
-             self.log(f"Пропуск Mean Reversion: Нет подтвержденного возврата в канал BB."); return None
+        # 3. ИЗМЕНЕНО: Цена должна *значительно* пробить BB или вернуться к ней
+        is_pierced = low_price < (lower_bb * Decimal('0.995')) # Сильный пробой
+        is_at_band = (current_price >= lower_bb) and (low_price < lower_bb) # Возврат
+        
+        if not (is_pierced or is_at_band):
+             self.log(f"Пропуск Mean Reversion: Нет пробоя или возврата в BB."); return None
 
-        self.log(f"    -> СИГНАЛ (Mean Reversion 4H): ADX < 25, RSI < 35, Цена вернулась внутрь Lower BB.")
-        return {"decision": "BUY", "signal_candle": signal_candle, "type": "MEAN_REVERSION"}
+        # 4. Расчет R:R
+        entry_price = current_price
+        # SL: на 1.5 ATR ниже минимума
+        stop_loss_price = self._round_price(low_price - (atr_4h * self.atr_multiplier_sl))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: Средняя линия BB
+        target_tp = self._round_price(middle_bb)
+        reward_per_coin = target_tp - entry_price
+        if reward_per_coin <= 0: return None
+        
+        rr_ratio = reward_per_coin / risk_per_coin
 
-    def _find_entry_breakout_4h(self, market_data):
-        # (без изменений)
+        self.log(f"    -> Кандидат (Mean Reversion): Возврат в BB. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {
+            "type": "MEAN_REVERSION",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "final_take_profit_price": target_tp,
+            "rr_ratio": rr_ratio
+        }
+
+    # --- СТРАТЕГИЯ 2 (ИЗМЕНЕНО): Breakout & Retest (KC 4H) ---
+    def _find_entry_breakout_retest_4h(self, market_data, current_price):
         ind_4h = market_data.get('indicators_4h')
-        if ind_4h is None or len(ind_4h) < (self.kc_len + 1):
-            self.log("Пропуск Breakout 4H: Недостаточно данных."); return None
-        signal_candle = ind_4h.iloc[-1]
+        ind_1h = market_data.get('indicators_1h')
+        if ind_4h is None or ind_1h is None or len(ind_4h) < 30 or len(ind_1h) < 2:
+            return None
+        
+        # Нам нужны 2 последние 4H свечи
+        prev_4h, last_4h = ind_4h.iloc[-2], ind_4h.iloc[-1]
+        
         try:
-            adx = Decimal(str(signal_candle[f'ADX_{self.adx_len}']))
+            # Данные для Breakout
+            prev_close = Decimal(str(prev_4h['close']))
+            prev_upper_kc = Decimal(str(prev_4h[f'KCUe_{self.kc_len}_{self.kc_scalar}']))
+            prev_adx = Decimal(str(prev_4h[f'ADX_{self.adx_len}']))
             
-            # --- УЛУЧШЕНИЕ: Читаем DMP (DI+) и DMN (DI-) ---
-            dmp = Decimal(str(signal_candle[f'DMP_{self.adx_len}']))
-            dmn = Decimal(str(signal_candle[f'DMN_{self.adx_len}']))
+            # Данные для Retest
+            last_low = Decimal(str(last_4h['low']))
+            last_atr = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
             
-            close_price = Decimal(str(signal_candle['close']))
-            upper_kc = Decimal(str(signal_candle[f'KCUe_{self.kc_len}_{self.kc_scalar}']))
-            volume = Decimal(str(signal_candle['volume']))
-            avg_volume = Decimal(str(signal_candle[f'VOL_SMA_{self.vol_sma_len}']))
         except (ValueError, KeyError):
-            self.log(f"Пропуск Breakout 4H: Ошибка данных ADX/DI/KC/Volume. {signal_candle}"); return None
+            self.log(f"Пропуск Breakout/Retest: Ошибка данных KC/ADX."); return None
             
-        if adx <= 25:
-            self.log(f"Пропуск Breakout 4H: ADX ({adx:.1f}) <= 25 (слабый тренд)."); return None
+        # 1. Ищем свечу "Breakout" (предыдущая свеча)
+        is_breakout_candle = (prev_close > prev_upper_kc) and (prev_adx > 20)
+        if not is_breakout_candle:
+            self.log("Пропуск B/R: Нет 4H свечи пробоя (Close > KC) на прошлой свече."); return None
             
-        # --- УЛУЧШЕНИЕ: Проверяем, что DI+ > DI- ---
-        if dmp <= dmn:
-            self.log(f"Пропуск Breakout 4H: Тренд не бычий (DMP: {dmp:.1f} <= DMN: {dmn:.1f})."); return None
+        # 2. Ищем "Retest" (текущая цена или 1H свеча)
+        # Уровень ретеста = Верхняя KC *прошлой* свечи
+        retest_level = prev_upper_kc
+        
+        # Цена должна быть сейчас в зоне ретеста
+        if not (retest_level * Decimal('0.995') < current_price < retest_level * Decimal('1.01')):
+            self.log(f"Пропуск B/R: Цена {current_price} не в зоне ретеста {retest_level:.2f}"); return None
+            
+        # 3. Ищем 1H бычий паттерн на этом уровне
+        signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
+        is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
+        if not (is_hammer or is_engulfing):
+            self.log("Пропуск B/R: Нет 1H паттерна (Hammer/Engulfing) на уровне ретеста."); return None
+            
+        # 4. Расчет R:R
+        entry_price = current_price
+        # SL: Под минимум последней 4H свечи (которая делала ретест)
+        stop_loss_price = self._round_price(last_low - (last_atr * Decimal('0.2')))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: 3R (пробойные стратегии обычно имеют высокий R:R)
+        reward_per_coin = risk_per_coin * Decimal('3.0')
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = Decimal('3.0')
+            
+        self.log(f"    -> Кандидат (Breakout & Retest): 1H паттерн на 4H KC ретесте. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {
+            "type": "BREAKOUT_4H",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "final_take_profit_price": target_tp,
+            "rr_ratio": rr_ratio
+        }
 
-        if close_price <= upper_kc:
-            self.log(f"Пропуск Breakout 4H: Цена ({close_price}) не пробила Upper KC ({upper_kc})."); return None
-            
-        if volume <= avg_volume:
-            self.log(f"Пропуск Breakout 4H: Объем ({volume}) <= среднего ({avg_volume})."); return None
-            
-        self.log(f"    -> СИГНАЛ (Breakout 4H): ADX > 25, DI+ > DI-, Цена > Upper KC, Объем > SMA(20).")
-        return {"decision": "BUY", "signal_candle": signal_candle, "type": "BREAKOUT_4H"}
-
-    def _find_entry_momentum_1h(self, market_data):
-        # (без изменений)
+    # --- СТРАТЕГИЯ 3 (ИЗМЕНЕНО): Momentum Pullback (1H) ---
+    def _find_entry_momentum_pullback_1h(self, market_data, current_price):
         ind_1h = market_data.get('indicators_1h')
         ind_4h = market_data.get('indicators_4h')
-        if ind_1h is None or ind_4h is None or len(ind_1h) < (self.ema_fast_len + 2) or len(ind_4h) < (self.ema_slow_len + 1):
-            self.log("Пропуск Momentum 1H: Недостаточно данных 1H/4H."); return None
-        signal_1h = ind_1h.iloc[-1]; prev_1h = ind_1h.iloc[-2]; signal_4h = ind_4h.iloc[-1]
+        if ind_1h is None or ind_4h is None or len(ind_1h) < 30 or len(ind_4h) < self.ema_slow_len:
+            return None
+        
+        last_4h = ind_4h.iloc[-1]
+        last_1h = ind_1h.iloc[-1]; prev_1h = ind_1h.iloc[-2]
+        
         try:
-            price_4h = Decimal(str(signal_4h['close']))
-            ema_50_4h = Decimal(str(signal_4h[f'EMA_{self.ema_slow_len}']))
-            
-            # --- УЛУЧШЕНИЕ: Читаем 4H RSI ---
-            rsi_4h = Decimal(str(signal_4h['RSI_14']))
-            
-            ema_9_1h = Decimal(str(signal_1h[f'EMA_{self.ema_superfast_len}']))
-            ema_21_1h = Decimal(str(signal_1h[f'EMA_{self.ema_fast_len}']))
-            rsi_1h = Decimal(str(signal_1h['RSI_14']))
-            stoch_k_1h = Decimal(str(signal_1h['STOCHRSIk_14_14_3_3']))
-            stoch_d_1h = Decimal(str(signal_1h['STOCHRSId_14_14_3_3']))
+            # 1. 4H Фильтр: Глобальный тренд вверх
+            price_4h = Decimal(str(last_4h['close']))
+            ema_50_4h = Decimal(str(last_4h[f'EMA_{self.ema_slow_len}']))
+            if price_4h <= ema_50_4h:
+                self.log(f"Пропуск Momentum Pullback: 4H цена ({price_4h}) <= 4H EMA50 ({ema_50_4h})."); return None
+
+            # 2. 1H Фильтр: Локальный тренд вверх
+            ema_9_1h = Decimal(str(last_1h[f'EMA_{self.ema_superfast_len}']))
+            ema_21_1h = Decimal(str(last_1h[f'EMA_{self.ema_fast_len}']))
+            if ema_9_1h <= ema_21_1h:
+                self.log(f"Пропуск Momentum Pullback: 1H EMA9 ({ema_9_1h}) <= 1H EMA21 ({ema_21_1h})."); return None
+                
+            # 3. ИЗМЕНЕННЫЙ СИГНАЛ: Ищем 1H откат (StochRSI в перепроданности)
+            stoch_k_1h = Decimal(str(last_1h['STOCHRSIk_14_14_3_3']))
+            stoch_d_1h = Decimal(str(last_1h['STOCHRSId_14_14_3_3']))
             stoch_k_prev_1h = Decimal(str(prev_1h['STOCHRSIk_14_14_3_3']))
-            stoch_d_prev_1h = Decimal(str(prev_1h['STOCHRSId_14_14_3_3']))
+            
+            # StochK должен быть < 30 (зона отката) и пересекать StochD снизу вверх
+            is_oversold_cross = (stoch_k_1h < 30) and (stoch_k_prev_1h <= stoch_d_1h) and (stoch_k_1h > stoch_d_1h)
+            
+            if not is_oversold_cross:
+                self.log("Пропуск Momentum Pullback: Нет StochRSI пересечения в зоне < 30."); return None
+
         except (ValueError, KeyError):
-            self.log("Пропуск Momentum 1H: Ошибка данных EMA/RSI/StochRSI."); return None
+            self.log("Пропуск Momentum Pullback: Ошибка данных EMA/StochRSI."); return None
             
-        if price_4h <= ema_50_4h:
-            self.log(f"Пропуск Momentum 1H: 4H цена ({price_4h}) <= 4H EMA50 ({ema_50_4h})."); return None
-
-        # --- УЛУЧШЕНИЕ: Проверяем 4H RSI ---
-        if rsi_4h <= 50:
-            self.log(f"Пропуск Momentum 1H: 4H RSI ({rsi_4h:.1f}) <= 50."); return None
-
-        if ema_9_1h <= ema_21_1h:
-            self.log(f"Пропуск Momentum 1H: 1H EMA9 ({ema_9_1h}) <= 1H EMA21 ({ema_21_1h})."); return None
-            
-        if rsi_1h <= 55:
-            self.log(f"Пропуск Momentum 1H: 1H RSI ({rsi_1h}) <= 55."); return None
-            
-        is_fresh_cross = stoch_k_prev_1h <= stoch_d_prev_1h and stoch_k_1h > stoch_d_1h
-        is_rising_momentum = stoch_k_1h > stoch_d_1h and stoch_k_1h > stoch_k_prev_1h
-        if not (is_fresh_cross or is_rising_momentum):
-            self.log("Пропуск Momentum 1H: Нет сигнала StochRSI."); return None
-            
-        self.log(f"    -> СИГНАЛ (Momentum 1H): 4H > EMA50, 4H RSI > 50, 1H EMA9 > 21, RSI > 55, StochRSI бычий.")
-        return {"decision": "BUY", "signal_candle": signal_1h, "type": "MOMENTUM_1H"}
+        # 4. Расчет R:R
+        entry_price = current_price
+        # SL: Под 1H EMA 21 (динамическая поддержка)
+        stop_loss_price = self._round_price(ema_21_1h * Decimal('0.998'))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: 2R (стандарт для моментум-стратегий)
+        reward_per_coin = risk_per_coin * Decimal('2.0')
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = Decimal('2.0')
+        
+        self.log(f"    -> Кандидат (Momentum Pullback): StochRSI откат в 1H/4H аптренде. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {
+            "type": "MOMENTUM_1H",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "final_take_profit_price": target_tp,
+            "rr_ratio": rr_ratio
+        }
     
     # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ PA ---
     def _is_bullish_pin_bar(self, c):
-        # (Эта функция была в коде, но не использовалась. Теперь используется.)
         c_open, c_close, c_high, c_low = Decimal(str(c['open'])), Decimal(str(c['close'])), Decimal(str(c['high'])), Decimal(str(c['low']))
         body, rng = abs(c_close - c_open), c_high - c_low
         if body == 0 or rng == 0: return False
@@ -627,6 +768,15 @@ class TradingBot(threading.Thread):
         c_open, c_close = Decimal(str(c['open'])), Decimal(str(c['close']))
         return (c_close > prev_open) and (c_open < prev_close) and (c_close > c_open) and (prev_close < prev_open)
 
+    # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ TP ---
+    def _get_next_resistance(self, key_levels, entry_price):
+        if not key_levels['resistances']: return None
+        # Ищем первый уровень сопротивления, который ВЫШЕ цены входа
+        for res in key_levels['resistances']:
+            if res > entry_price:
+                return self._round_price(res)
+        return None # Не найдено
+
     # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (RSI Divergence) ---
     def _find_exit_rsi_divergence_4h(self, market_data):
         ind_4h = market_data.get('indicators_4h')
@@ -644,103 +794,52 @@ class TradingBot(threading.Thread):
         if new_stop_price > self.stop_loss_price: return new_stop_price
         return None
         
-    # --- ГЛАВНЫЙ МОДУЛЬ РАСЧЕТА И ОТКРЫТИЯ ПОЗИЦИИ ---
-    def _calculate_and_open_position(self, decision, market_data):
-        # (Эта функция без изменений из прошлой версии, она уже универсальна)
-        entry_price = market_data['current_price']
-        signal_candle = decision['signal_candle']
-        self.current_trade_strategy_type = decision.get('type', 'UNKNOWN')
+    # ---
+    # --- ИЗМЕНЕНО: ГЛАВНЫЙ МОДУЛЬ РАСЧЕТА И ОТКРЫТИЯ ПОЗИЦИИ ---
+    # ---
+    def _calculate_and_open_position(self, best_signal, market_data):
         
-        ind_4h = market_data.get('indicators_4h')
+        # --- 1. Получаем все данные из pre-calculated сигнала ---
+        entry_price = best_signal['entry_price']
+        stop_loss_price = best_signal['stop_loss_price']
+        self.final_take_profit_price = best_signal['final_take_profit_price']
+        rr_ratio = best_signal['rr_ratio']
+        self.current_trade_strategy_type = best_signal['type']
+        
+        risk_per_coin = entry_price - stop_loss_price
+        
+        # --- 2. Рассчитываем TP1 (кроме Mean Reversion) ---
+        if self.current_trade_strategy_type == 'MEAN_REVERSION':
+            self.take_profit_price_1 = self.final_take_profit_price
+            self.log(f"     -> Расчет для Mean Reversion. R/R: {rr_ratio:.1f}:1")
+        else:
+            # TP1 ставится на 1R
+            self.take_profit_price_1 = self._round_price(entry_price + (risk_per_coin * Decimal('1.0')))
+            self.log(f"     -> Расчет для {self.current_trade_strategy_type}. R/R: {rr_ratio:.1f}:1")
+
+        # --- 3. ОБЩАЯ ЛОГИКА РАСЧЕТА РАЗМЕРА ПОЗИЦИИ ---
+        usdt_balance = market_data['usdt_balance']
+        
         try:
+            ind_4h = market_data.get('indicators_4h')
             current_atr_perc = (Decimal(str(ind_4h.iloc[-1]['ATRr_14'])) / entry_price) * 100
         except (IndexError, ValueError):
             self.log("Пропуск открытия: Недопустимые данные 4H ATR."); return
-
-        # --- Расчет SL/TP в зависимости от типа стратегии ---
-        if self.current_trade_strategy_type == 'EMA_CROSS' or self.current_trade_strategy_type == 'PRICE_ACTION':
-            try:
-                current_atr = Decimal(str(signal_candle[f'ATRr_{self.atr_period}']))
-                stop_loss_price = self._round_price(Decimal(str(signal_candle['low'])) - (current_atr * self.atr_multiplier_sl))
-            except (ValueError, KeyError):
-                self.log(f"Пропуск открытия ({self.current_trade_strategy_type}): Недопустимые данные свечи."); return
-            dynamic_rr = self.base_rr_ratio
-            if current_atr_perc > 2.5: dynamic_rr *= Decimal('1.2')
-            elif current_atr_perc < 1.0: dynamic_rr *= Decimal('0.8')
-            risk_per_coin = entry_price - stop_loss_price
             
-        elif self.current_trade_strategy_type == 'RSI_DIVERGENCE':
-            stop_ref_candle = decision['stop_loss_ref_candle']
-            try:
-                current_atr = Decimal(str(stop_ref_candle[f'ATRr_{self.atr_period}']))
-                stop_loss_price = self._round_price(Decimal(str(stop_ref_candle['low'])) - (current_atr * self.atr_multiplier_sl))
-            except (ValueError, KeyError):
-                self.log(f"Пропуск открытия ({self.current_trade_strategy_type}): Недопустимые данные свечи для стопа."); return
-            dynamic_rr = Decimal('3.0')
-            risk_per_coin = entry_price - stop_loss_price
-
-        elif self.current_trade_strategy_type == 'MEAN_REVERSION':
-            try:
-                current_atr = Decimal(str(signal_candle[f'ATRr_{self.atr_period}']))
-                stop_loss_price = self._round_price(Decimal(str(signal_candle['low'])) - (current_atr * self.atr_multiplier_sl))
-                take_profit_target = self._round_price(Decimal(str(signal_candle[f'BBM_{self.bb_len}_{self.bb_std}_{self.bb_std}'])))
-            except (ValueError, KeyError):
-                self.log("Пропуск открытия (MR): Недопустимые данные свечи или BB."); return
-            if take_profit_target <= entry_price:
-                self.log("Пропуск открытия (MR): Цель (Middle BB) ниже или равна цене входа."); return
-            risk_per_coin = entry_price - stop_loss_price
-            if risk_per_coin <= 0: self.log("ИНФО (MR): Вход пропущен. Риск <= 0."); return
-            self.take_profit_price_1 = take_profit_target
-            self.final_take_profit_price = take_profit_target
-            dynamic_rr = (take_profit_target - entry_price) / risk_per_coin if risk_per_coin > 0 else Decimal('0')
-            self.log(f"     -> Расчет для Mean Reversion. R/R: {dynamic_rr:.1f}:1")
-
-        elif self.current_trade_strategy_type == 'BREAKOUT_4H':
-            try:
-                stop_loss_price = self._round_price(Decimal(str(signal_candle[f'KCBe_{self.kc_len}_{self.kc_scalar}'])))
-            except (ValueError, KeyError):
-                self.log("Пропуск открытия (Breakout): Недопустимые данные KC."); return
-            risk_per_coin = entry_price - stop_loss_price
-            if risk_per_coin <= 0: self.log("ИНФО (Breakout): Вход пропущен. Риск <= 0."); return
-            dynamic_rr = Decimal('3.0')
-            self.log(f"     -> Расчет для Breakout 4H. R/R: {dynamic_rr:.1f}:1")
-        
-        elif self.current_trade_strategy_type == 'MOMENTUM_1H':
-            ind_1h = market_data.get('indicators_1h')
-            if ind_1h is None or len(ind_1h) < self.ema_fast_len + 1:
-                self.log("Пропуск открытия (Momentum): Нет данных 1H для SL."); return
-            try:
-                signal_candle_1h = ind_1h.iloc[-1]
-                ema_21_1h = Decimal(str(signal_candle_1h[f'EMA_{self.ema_fast_len}']))
-                low_1h = Decimal(str(signal_candle_1h['low']))
-                stop_loss_price = self._round_price(min(ema_21_1h * Decimal('0.998'), low_1h * Decimal('0.998'))) 
-            except (ValueError, KeyError):
-                self.log("Пропуск открытия (Momentum): Недопустимые данные 1H EMA."); return
-            risk_per_coin = entry_price - stop_loss_price
-            if risk_per_coin <= 0: self.log("ИНФО (Momentum): Вход пропущен. Риск <= 0."); return
-            dynamic_rr = Decimal('2.0')
-            self.log(f"     -> Расчет для Momentum 1H. R/R: {dynamic_rr:.1f}:1")
-        else:
-            self.log(f"ОШИБКА: Неизвестный тип стратегии '{self.current_trade_strategy_type}'. Вход отменен."); return
-
-        if self.current_trade_strategy_type != 'MEAN_REVERSION':
-            if risk_per_coin <= 0: 
-                self.log("ИНФО: Вход пропущен. Расчетный риск на монету <= 0."); return
-            self.take_profit_price_1 = self._round_price(entry_price + (risk_per_coin * Decimal('1.0')))
-            self.final_take_profit_price = self._round_price(entry_price + (risk_per_coin * dynamic_rr))
-        
-        # --- ОБЩАЯ ЛОГИКА РАСЧЕТА РАЗМЕРА ПОЗИЦИИ ---
-        usdt_balance = market_data['usdt_balance']
         risk_per_trade = self.base_risk_per_trade
         if current_atr_perc > 3:
             risk_per_trade = self.base_risk_per_trade * Decimal('0.5')
             self.log(f"     -> Высокая волатильность (>3% ATR), риск уменьшен до {risk_per_trade * 100:.2f}%")
         
         risk_capital = usdt_balance * risk_per_trade
+        
+        if risk_per_coin <= 0: 
+            self.log(f"ИНФО: Вход {self.current_trade_strategy_type} пропущен. Расчетный риск на монету <= 0."); return
+            
         quantity = self._round_quantity(risk_capital / risk_per_coin)
         
         if quantity <= 0:
-            self.log("ИНФО: Вход пропущен. Рассчитанное количество <= 0 (риск слишком мал)."); return
+            self.log(f"ИНФО: Вход {self.current_trade_strategy_type} пропущен. Рассчитанное количество <= 0 (риск слишком мал)."); return
         
         position_cost = quantity * entry_price
         
@@ -757,13 +856,25 @@ class TradingBot(threading.Thread):
         if position_cost < self.min_notional:
             self.log(f"ИНФО: Вход пропущен. Размер позиции (${position_cost:.2f}) меньше минимально допустимого (${self.min_notional:.2f})."); return
 
+        # --- 4. ИСПОЛНЕНИЕ ОРДЕРА ---
         self.trade_counter += 1
         self.current_trade_id = f"{self.symbol[:3]}-{self.trade_counter}"
         self.current_trade_pnl = Decimal('0.0')
 
         try:
             self.log(f"ИСПОЛНЕНИЕ ОРДЕРА (BUY, {self.current_trade_strategy_type}): {quantity} {self.base_asset} по рыночной цене...")
-            order_result = self.binance_client.create_order(symbol=self.symbol, side=Client.SIDE_BUY, type=Client.ORDER_TYPE_MARKET, quantity=float(quantity), trigger_price=None)
+            
+            # В бэктесте мы передаем 'entry_price', чтобы симулировать исполнение по этой цене
+            trigger_price = entry_price if self.is_backtest else None
+            
+            order_result = self.binance_client.create_order(
+                symbol=self.symbol, 
+                side=Client.SIDE_BUY, 
+                type=Client.ORDER_TYPE_MARKET, 
+                quantity=float(quantity), 
+                trigger_price=trigger_price # Используется только в mock-клиенте
+            )
+            
             self._process_filled_order(order_result, "SWING OPEN")
             self.position_side, self.stop_loss_price = 'LONG', stop_loss_price
             self.entry_time = self._get_current_time()
@@ -778,7 +889,7 @@ class TradingBot(threading.Thread):
             if self.current_trade_strategy_type == 'MEAN_REVERSION':
                  self.log(f"    - TP (Оба): ${self.final_take_profit_price:.{self.price_precision}f} (Middle BB)")
             else:
-                 self.log(f"    - TP1 (50%): ${self.take_profit_price_1:.{self.price_precision}f}, Финальный TP: ${self.final_take_profit_price:.{self.price_precision}f} (RR: {dynamic_rr:.1f}:1)")
+                 self.log(f"    - TP1 (50%): ${self.take_profit_price_1:.{self.price_precision}f}, Финальный TP: ${self.final_take_profit_price:.{self.price_precision}f} (RR: {rr_ratio:.1f}:1)")
         except BinanceAPIException as e:
             if e.code == -2010: self.log(f"ОШИБКА ОТКРЫТИЯ: Недостаточно средств на балансе. {e.message}")
             else: self.log(f"ОШИБКА API при открытии позиции: {e}")
@@ -882,7 +993,7 @@ class TradingBot(threading.Thread):
             self.log(f"{log_type}: Цена={current_price:.{self.price_precision}f}, SL={self.stop_loss_price:.{self.price_precision}f}, TP={log_tp}")
 
     def _close_position(self, reason="", is_partial=False, partial_ratio=0.5, execution_price=None):
-        # *** ЭТА ФУНКЦИЯ ИСПРАВЛЕНА ***
+        # (Эта функция без изменений)
         if not self.position_side: return
         qty_to_sell = (self.quantity * Decimal(str(partial_ratio))) if is_partial else self.quantity
         if qty_to_sell <= 0: return
