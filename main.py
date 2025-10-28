@@ -366,7 +366,6 @@ class App:
         self.status_bar.config(text="Статус: В работе..." if is_running else "Статус: Остановлен.")
     
     def process_event_queue(self):
-        # (Эта функция без изменений)
         try:
             while True:
                 event = self.event_queue.get_nowait()
@@ -382,15 +381,47 @@ class App:
                     trade_id = event_data['trade_id']; self.total_pnl_history[trade_id] = Decimal('0.0')
                     values = (trade_id, event_data['strategy'], event_data['side'], event_data['entry_time'], event_data['entry_price'], event_data['quantity'], '...', '...', '...')
                     item_id = self.trades_tree.insert("", 0, values=values); self.trade_view_items[trade_id] = item_id
+                
+                # --- БЛОК ИСПРАВЛЕНИЯ ---
                 elif event_type == 'update_trade':
                     trade_id = event_data['trade_id']; item_id = self.trade_view_items.get(trade_id)
                     if item_id:
-                        self.total_pnl_history[trade_id] += Decimal(event_data['pnl']); total_pnl_for_trade = self.total_pnl_history[trade_id]
-                        pnl_text = f"{total_pnl_for_trade:+.2f}"; 
-                        if event_data['is_partial']: pnl_text += " (TP1)"
+                        # --- ИЗМЕНЕНИЕ: Исправлена логика обновления строки сделки ---
+                        self.total_pnl_history[trade_id] += Decimal(event_data['pnl']);
+                        total_pnl_for_trade = self.total_pnl_history[trade_id]
+
+                        pnl_text = f"{total_pnl_for_trade:+.2f}"
+                        
+                        # Получаем оставшееся кол-во (из trading_bot.py)
+                        # current_values[5] - это старое кол-во
+                        current_quantity_str = event_data.get('remaining_quantity')
+
+                        # Если это частичное закрытие
+                        if event_data.get('is_partial') == True:
+                            pnl_text += " (TP1)"
+                            # current_quantity_str уже содержит *оставшееся* кол-во
+                        else:
+                            # Это полное закрытие.
+                            # 'pnl_text' уже содержит *итоговый* PnL
+                            current_quantity_str = f"0.0" # Явно ставим 0
+                        
                         current_values = self.trades_tree.item(item_id)['values']
-                        updated_values = (current_values[0], current_values[1], current_values[2], current_values[3], current_values[4], current_values[5], event_data['exit_time'], event_data['exit_price'], pnl_text)
+                        
+                        updated_values = (
+                            current_values[0], # ID
+                            current_values[1], # Стратегия
+                            current_values[2], # Сторона
+                            current_values[3], # Время входа
+                            current_values[4], # Цена входа
+                            current_quantity_str,    # <--- ОБНОВЛЕННОЕ Кол-во
+                            event_data['exit_time'],   # Обновленное Время выхода
+                            event_data['exit_price'],  # Обновленная Цена выхода
+                            pnl_text                 # Обновленный PnL
+                        )
                         self.trades_tree.item(item_id, values=updated_values)
+                        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                # --- КОНЕЦ БЛОКА ИСПРАВЛЕНИЯ ---
+                        
                 elif event_type == 'strategy_stats_update':
                     for stype, data in event_data.items():
                         if stype in self.strategy_labels:
