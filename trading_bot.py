@@ -32,7 +32,7 @@ except ImportError:
 STATE_FILE = "bot_state_multi_strategy.json"
 
 
-# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v8.8 Relaxed Filters) ---
+# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v8.9 No-BTC, Super-Relaxed) ---
 class TradingBot(threading.Thread):
     
     def __init__(self, api_key, api_secret, event_queue, risk_per_trade, rr_ratio, symbol, active_strategies_config, backtest_client=None):
@@ -182,7 +182,8 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"ОШИБКА: Не удалось загрузить состояние бота: {e}")
 
     def run(self):
-        bot_name = "Multi-Strategy Trader v8.8 (Relaxed Filters)" # --- ИЗМЕНЕНО ---
+        # --- ИЗМЕНЕНИЕ: Название бота ---
+        bot_name = "Multi-Strategy Trader v8.9 (No-BTC, Super-Relaxed)"
         mode = "БЭКТЕСТ (1M)" if self.is_backtest else "РЕАЛЬНАЯ ТОРГОВЛЯ" 
         self.log(f"Запуск бота '{bot_name}' в режиме '{mode}' для символа {self.symbol}...")
         
@@ -284,7 +285,7 @@ class TradingBot(threading.Thread):
         self.log(status_msg)
 
     # ---
-    # --- ИЗМЕНЕНО: ГЛАВНАЯ ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v8.8) ---
+    # --- ИЗМЕНЕНО: ГЛАВНАЯ ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v8.9) ---
     # ---
     def _get_algorithmic_decision(self, market_data, current_price):
         
@@ -301,39 +302,9 @@ class TradingBot(threading.Thread):
         except ValueError:
             self.log("Предупреждение: Недопустимые данные в индикаторах 1D. Пропуск."); return None
 
-        ind_1d_btc = market_data.get('indicators_1d_btc')
-        is_btc_bull_trend = False
-        if ind_1d_btc is None or len(ind_1d_btc) < self.ema_trend_len:
-            reason = "Ожидание данных для BTCUSDT 1D"
-            self._log_daily_status(reason); return None
-        try:
-            btc_price_1d = Decimal(str(ind_1d_btc.iloc[-1]['close']))
-            btc_ema200_1d = Decimal(str(ind_1d_btc.iloc[-1][f'EMA_{self.ema_trend_len}']))
-            is_btc_bull_trend = btc_price_1d > btc_ema200_1d # Просто определяем, не блокируем
-        except ValueError:
-            self.log("Предупреждение: Недопустимые данные в индикаторах BTC 1D. Пропуск."); return None
-
-        # --- 2. Глобальный фильтр корреляции (ОСТАВЛЕН) ---
-        corr_period = 30
-        if len(ind_1d) >= corr_period and len(ind_1d_btc) >= corr_period:
-            try:
-                symbol_closes = np.array(ind_1d['close'].tail(corr_period).astype(float))
-                btc_closes = np.array(ind_1d_btc['close'].tail(corr_period).astype(float))
-                if np.isnan(symbol_closes).any() or np.isnan(btc_closes).any():
-                    self.log("Предупреждение: NaN в данных корреляции. Пропуск проверки.")
-                else:
-                    correlation = np.corrcoef(symbol_closes, btc_closes)[0, 1]
-                    # --- ИЗМЕНЕНИЕ: Используем btc_price_1d и btc_ema200_1d (уже есть)
-                    btc_prev_close = Decimal(str(ind_1d_btc.iloc[-2]['close']))
-                    btc_change = (btc_price_1d - btc_prev_close) / btc_prev_close
-                    
-                    if correlation > 0.8 and btc_change < 0:
-                        reason = f"Корреляция с BTC > 0.8 ({correlation:.2f}) и BTC падает ({btc_change:.2%}). Покупки запрещены (фильтр риска)."
-                        self._log_daily_status(reason); return None
-            except Exception as e:
-                 self.log(f"Ошибка проверки корреляции: {e}")
+        # --- ИЗМЕНЕНИЕ: ФИЛЬТР BTC И КОРРЕЛЯЦИИ ПОЛНОСТЬЮ УДАЛЕН ---
         
-        self._log_daily_status(f"1D Тренд: {'' if is_1d_bull_trend else 'НЕ '}Бычий. BTC Тренд: {'' if is_btc_bull_trend else 'НЕ '}Бычий. Поиск сигналов...")
+        self._log_daily_status(f"1D Тренд: {'' if is_1d_bull_trend else 'НЕ '}Бычий. Поиск сигналов...")
 
         # --- 3. Сбор и Приоритезация Сигналов ---
         all_potential_signals = []
@@ -346,14 +317,14 @@ class TradingBot(threading.Thread):
 
         # --- Стратегия 2: Breakout & Retest (Нужен 1D тренд) ---
         if self.active_strategies.get("BREAKOUT_4H", False):
-            # --- ИЗМЕНЕНИЕ: Передаем флаги тренда ---
-            signal = self._find_entry_breakout_retest_4h(market_data, current_price, is_1d_bull_trend, is_btc_bull_trend)
+            # --- ИЗМЕНЕНИЕ: Убран 'is_btc_bull_trend' ---
+            signal = self._find_entry_breakout_retest_4h(market_data, current_price, is_1d_bull_trend)
             if signal: all_potential_signals.append(signal)
 
         # --- Стратегия 3: Momentum Pullback (Нужен 1D тренд) ---
         if self.active_strategies.get("MOMENTUM_1H", False):
-            # --- ИЗМЕНЕНИЕ: Передаем флаги тренда ---
-            signal = self._find_entry_momentum_pullback_1h(market_data, current_price, is_1d_bull_trend, is_btc_bull_trend)
+            # --- ИЗМЕНЕНИЕ: Убран 'is_btc_bull_trend' ---
+            signal = self._find_entry_momentum_pullback_1h(market_data, current_price, is_1d_bull_trend)
             if signal: all_potential_signals.append(signal)
 
         # --- Стратегия 4: Swing (RSI Дивергенция) (Не зависит от 1D тренда) ---
@@ -405,7 +376,7 @@ class TradingBot(threading.Thread):
         return levels
 
     # ---
-    # --- ИЗМЕНЕННЫЕ СТРАТЕГИИ (v8.8) ---
+    # --- ИЗМЕНЕННЫЕ СТРАТЕГИИ (v8.9) ---
     # ---
 
     # --- СТРАТЕГИЯ 6 (ИЗМЕНЕНО): EMA Pullback (Откат к EMA) ---
@@ -471,7 +442,7 @@ class TradingBot(threading.Thread):
             "rr_ratio": rr_ratio
         }
 
-    # --- СТРАТЕГИЯ 4 (ИЗМЕНЕНО): RSI Divergence (с 1H подтверждением) ---
+    # --- СТРАТЕГИЯ 4 (ИЗМЕНЕНО): RSI Divergence (БЕЗ 1H подтверждения) ---
     def _find_entry_rsi_divergence_4h(self, market_data, current_price):
         ind_4h = market_data.get('indicators_4h')
         ind_1h = market_data.get('indicators_1h')
@@ -495,15 +466,13 @@ class TradingBot(threading.Thread):
         price_at_last_rsi_low, price_at_prev_rsi_low = recent_data.loc[last_rsi_low_idx]['low'], recent_data.loc[prev_rsi_low_idx]['low']
         if not (price_at_last_rsi_low < price_at_prev_rsi_low): return None
             
-        # 4. Ищем 1H паттерн (раннее подтверждение)
-        signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
-        is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
+        # 4. Дивергенция должна была случиться недавно (на последних 5-х 4H свечах)
+        # --- ИЗМЕНЕНИЕ: Ослаблено (было 3) ---
+        is_recent_divergence = (ind_4h.index[-1] - last_rsi_low_idx) <= 5
         
-        # Дивергенция должна была случиться недавно (на последних 3-х 4H свечах)
-        is_recent_divergence = (ind_4h.index[-1] - last_rsi_low_idx) <= 3
-        
-        if not ((is_hammer or is_engulfing) and is_recent_divergence):
-             self.log(f"Пропуск RSI Div: Дивергенция найдена, но нет 1H паттерна (Hammer/Engulfing) для входа."); return None
+        # --- ИЗМЕНЕНИЕ: Убрано 1H PA подтверждение (is_hammer or is_engulfing) ---
+        if not is_recent_divergence:
+             self.log(f"Пропуск RSI Div: Дивергенция найдена, но не является недавней (окно > 5 свечей)."); return None
             
         # 5. Расчет R:R
         entry_price = current_price
@@ -521,7 +490,7 @@ class TradingBot(threading.Thread):
         
         rr_ratio = reward_per_coin / risk_per_coin
 
-        self.log(f"    -> Кандидат (RSI Divergence): 4H дивергенция + 1H PA. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        self.log(f"    -> Кандидат (RSI Divergence): 4H дивергенция (БЕЗ 1H PA). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {
             "type": "RSI_DIVERGENCE",
             "entry_price": entry_price,
@@ -550,10 +519,10 @@ class TradingBot(threading.Thread):
        except (ValueError, KeyError):
             self.log("Пропуск Price Action: Ошибка данных RSI/Volume/ATR."); return None
             
-       # 2. ИЗМЕНЕННЫЙ ФИЛЬТР: RSI должен быть < 45 (зона перепроданности)
-       # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 40) ---
-       if rsi_1h >= 45: 
-           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в зоне < 45."); return None
+       # 2. ИЗМЕНЕННЫЙ ФИЛЬТР: RSI должен быть < 50
+       # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 45) ---
+       if rsi_1h >= 50: 
+           self.log(f"Пропуск Price Action: RSI ({rsi_1h:.1f}) не в зоне < 50."); return None
            
        # 3. Цена у 4H поддержки
        is_near_support = any(abs(current_price - support) / support < Decimal('0.015') for support in key_levels['supports'])
@@ -581,7 +550,7 @@ class TradingBot(threading.Thread):
        rr_ratio = reward_per_coin / risk_per_coin
        pattern_type = "hammer" if is_hammer else ("engulfing" if is_engulfing else "pin_bar")
        
-       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type}, RSI < 45, у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type}, RSI < 50, у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
        return {
             "type": "PRICE_ACTION",
             "entry_price": entry_price,
@@ -606,14 +575,15 @@ class TradingBot(threading.Thread):
         except (ValueError, KeyError):
             self.log("Пропуск Mean Reversion: Ошибка данных ADX/BB/RSI."); return None
             
-        # 1. Ищем флэт (ADX < 25)
-        if adx >= 25:
-            self.log(f"Пропуск Mean Reversion: ADX ({adx:.1f}) >= 25 (сильный тренд)."); return None
+        # 1. Ищем флэт (ADX < 30)
+        # --- ИЗМЕНЕНИЕ: Ослаблено (было 25) ---
+        if adx >= 30:
+            self.log(f"Пропуск Mean Reversion: ADX ({adx:.1f}) >= 30 (сильный тренд)."); return None
             
-        # 2. ИЗМЕНЕНО: Ищем реальную перепроданность (RSI < 35)
-        # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 30) ---
-        if rsi >= 35:
-            self.log(f"Пропуск Mean Reversion: RSI ({rsi:.1f}) >= 35."); return None
+        # 2. ИЗМЕНЕНО: Ищем перепроданность (RSI < 40)
+        # --- ИЗМЕНЕНИЕ: Ослаблено (было 35) ---
+        if rsi >= 40:
+            self.log(f"Пропуск Mean Reversion: RSI ({rsi:.1f}) >= 40."); return None
 
         # 3. ИЗМЕНЕНО: Цена должна *значительно* пробить BB или вернуться к ней
         is_pierced = low_price < (lower_bb * Decimal('0.995')) # Сильный пробой
@@ -646,11 +616,11 @@ class TradingBot(threading.Thread):
         }
 
     # --- СТРАТЕГИЯ 2 (ИЗМЕНЕНО): Breakout & Retest (KC 4H) ---
-    # --- ИЗМЕНЕНИЕ: Добавлены 'is_1d_bull_trend', 'is_btc_bull_trend' ---
-    def _find_entry_breakout_retest_4h(self, market_data, current_price, is_1d_bull_trend, is_btc_bull_trend):
-        # --- ИЗМЕНЕНИЕ: Проверка 1D тренда ---
-        if not (is_1d_bull_trend and is_btc_bull_trend):
-            self.log("Пропуск B/R: 1D тренд (Asset/BTC) не бычий."); return None
+    # --- ИЗМЕНЕНИЕ: Убран 'is_btc_bull_trend' ---
+    def _find_entry_breakout_retest_4h(self, market_data, current_price, is_1d_bull_trend):
+        # --- ИЗМЕНЕНИЕ: Проверка 1D тренда (БЕЗ BTC) ---
+        if not is_1d_bull_trend:
+            self.log("Пропуск B/R: 1D тренд (Asset) не бычий."); return None
 
         ind_4h = market_data.get('indicators_4h')
         ind_1h = market_data.get('indicators_1h')
@@ -664,7 +634,7 @@ class TradingBot(threading.Thread):
             # Данные для Breakout
             prev_close = Decimal(str(prev_4h['close']))
             prev_upper_kc = Decimal(str(prev_4h[f'KCUe_{self.kc_len}_{self.kc_scalar}']))
-            prev_adx = Decimal(str(prev_4h[f'ADX_{self.adx_len}']))
+            # prev_adx = Decimal(str(prev_4h[f'ADX_{self.adx_len}'])) # --- ИЗМЕНЕНИЕ: ADX больше не нужен ---
             
             # Данные для Retest
             last_low = Decimal(str(last_4h['low']))
@@ -674,7 +644,8 @@ class TradingBot(threading.Thread):
             self.log(f"Пропуск Breakout/Retest: Ошибка данных KC/ADX."); return None
             
         # 1. Ищем свечу "Breakout" (предыдущая свеча)
-        is_breakout_candle = (prev_close > prev_upper_kc) and (prev_adx > 20)
+        # --- ИЗМЕНЕНИЕ: Убран фильтр ADX > 20 ---
+        is_breakout_candle = (prev_close > prev_upper_kc)
         if not is_breakout_candle:
             self.log("Пропуск B/R: Нет 4H свечи пробоя (Close > KC) на прошлой свече."); return None
             
@@ -716,11 +687,11 @@ class TradingBot(threading.Thread):
         }
 
     # --- СТРАТЕГИЯ 3 (ИЗМЕНЕНО): Momentum Pullback (1H) ---
-    # --- ИЗМЕНЕНИЕ: Добавлены 'is_1d_bull_trend', 'is_btc_bull_trend' ---
-    def _find_entry_momentum_pullback_1h(self, market_data, current_price, is_1d_bull_trend, is_btc_bull_trend):
-        # --- ИЗМЕНЕНИЕ: Проверка 1D тренда ---
-        if not (is_1d_bull_trend and is_btc_bull_trend):
-            self.log("Пропуск Momentum Pullback: 1D тренд (Asset/BTC) не бычий."); return None
+    # --- ИЗМЕНЕНИЕ: Убран 'is_btc_bull_trend' ---
+    def _find_entry_momentum_pullback_1h(self, market_data, current_price, is_1d_bull_trend):
+        # --- ИЗМЕНЕНИЕ: Проверка 1D тренда (БЕЗ BTC) ---
+        if not is_1d_bull_trend:
+            self.log("Пропуск Momentum Pullback: 1D тренд (Asset) не бычий."); return None
 
         ind_1h = market_data.get('indicators_1h')
         ind_4h = market_data.get('indicators_4h')
@@ -748,12 +719,12 @@ class TradingBot(threading.Thread):
             stoch_d_1h = Decimal(str(last_1h['STOCHRSId_14_14_3_3']))
             stoch_k_prev_1h = Decimal(str(prev_1h['STOCHRSIk_14_14_3_3']))
             
-            # StochK должен быть < 35 (ОСЛАБЛЕНО) и пересекать StochD снизу вверх
-            # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 30) ---
-            is_oversold_cross = (stoch_k_1h < 35) and (stoch_k_prev_1h <= stoch_d_1h) and (stoch_k_1h > stoch_d_1h)
+            # StochK должен быть < 40 (ОСЛАБЛЕНО) и пересекать StochD снизу вверх
+            # --- ИЗМЕНЕНИЕ: Параметр ослаблен (было 35) ---
+            is_oversold_cross = (stoch_k_1h < 40) and (stoch_k_prev_1h <= stoch_d_1h) and (stoch_k_1h > stoch_d_1h)
             
             if not is_oversold_cross:
-                self.log("Пропуск Momentum Pullback: Нет StochRSI пересечения в зоне < 35."); return None
+                self.log("Пропуск Momentum Pullback: Нет StochRSI пересечения в зоне < 40."); return None
 
         except (ValueError, KeyError):
             self.log("Пропуск Momentum Pullback: Ошибка данных EMA/StochRSI."); return None
@@ -1175,16 +1146,16 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"Не удалось получить правила торгов для {self.symbol}. Ошибка: {e}"); return False
 
     def _get_market_data(self):
-        # (Эта функция без изменений)
+        # --- ИЗМЕНЕНИЕ: Убрана загрузка BTC ---
         try:
             kline_calls = { Client.KLINE_INTERVAL_1HOUR: 205, Client.KLINE_INTERVAL_4HOUR: 205, Client.KLINE_INTERVAL_1DAY: 250 }
-            btc_symbol = 'BTCUSDT'
+            # btc_symbol = 'BTCUSDT' # УДАЛЕНО
             with ThreadPoolExecutor(max_workers=5) as executor:
                 future_map = {}
                 for interval, limit in kline_calls.items(): 
                     future_map[executor.submit(self.binance_client.get_klines, symbol=self.symbol, interval=interval, limit=limit)] = {'type': 'klines', 'interval': interval}
-                    if interval == Client.KLINE_INTERVAL_1DAY:
-                        future_map[executor.submit(self.binance_client.get_klines, symbol=btc_symbol, interval=interval, limit=limit)] = {'type': 'klines_btc', 'interval': interval}
+                    # if interval == Client.KLINE_INTERVAL_1DAY: # УДАЛЕНО
+                    #    future_map[executor.submit(self.binance_client.get_klines, symbol=btc_symbol, interval=interval, limit=limit)] = {'type': 'klines_btc', 'interval': interval}
                 future_map[executor.submit(self.binance_client.get_asset_balance, asset=self.quote_asset)] = {'type': 'usdt_balance'}
                 future_map[executor.submit(self.binance_client.get_asset_balance, asset=self.base_asset)] = {'type': 'base_balance'}
                 future_map[executor.submit(self.binance_client.get_symbol_ticker, symbol=self.symbol)] = {'type': 'ticker'}
@@ -1194,14 +1165,14 @@ class TradingBot(threading.Thread):
                     try:
                         result_data = future.result()
                         if task_type == 'klines': klines_results[task_info['interval']] = result_data
-                        elif task_type == 'klines_btc': klines_results[f"{task_info['interval']}_btc"] = result_data
+                        # elif task_type == 'klines_btc': klines_results[f"{task_info['interval']}_btc"] = result_data # УДАЛЕНО
                         else: results[task_type] = result_data
                     except Exception as e: self.log(f"Ошибка в подзадаче {task_type}: {e}"); return None
             return {
                 "indicators_1h": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1HOUR)),
                 "indicators_4h": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_4HOUR)), 
                 "indicators_1d": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1DAY)),
-                "indicators_1d_btc": self._calculate_indicators(klines_results.get(f"{Client.KLINE_INTERVAL_1DAY}_btc")),
+                # "indicators_1d_btc": self._calculate_indicators(klines_results.get(f"{Client.KLINE_INTERVAL_1DAY}_btc")), # УДАЛЕНО
                 "usdt_balance": Decimal(results.get("usdt_balance", {}).get('free', '0')), 
                 "base_balance": Decimal(results.get("base_balance", {}).get('free', '0')),
                 "current_price": Decimal(results.get("ticker", {}).get('price', '0'))
