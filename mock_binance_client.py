@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import os
 import json
+import random # <-- Добавлено для симуляции slippage
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ (для этого модуля) ---
 logger = logging.getLogger(__name__)
@@ -22,9 +23,14 @@ except ImportError:
     pass 
 
 
-# --- СИМУЛЯTOR API BINANCE (без изменений) ---
+# --- СИМУЛЯTOR API BINANCE (v1.0 Scalp + Slippage) ---
 class MockBinanceClient:
     KLINE_INTERVAL_1MINUTE = '1m'
+    # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.0 Scalp) ***
+    KLINE_INTERVAL_3MINUTE = '3m'
+    KLINE_INTERVAL_5MINUTE = '5m'
+    KLINE_INTERVAL_15MINUTE = '15m'
+    # *** КОНЕЦ ИЗМЕНЕНИЯ ***
     KLINE_INTERVAL_1HOUR = '1h'
     KLINE_INTERVAL_4HOUR = '4h'
     KLINE_INTERVAL_1DAY = '1d'
@@ -49,12 +55,17 @@ class MockBinanceClient:
         self.current_tick = 0
         self.total_ticks = len(self.main_data_iterator)
         
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.0 Scalp) ***
         self.pd_interval_map = {
             self.KLINE_INTERVAL_1MINUTE: 'T',
+            self.KLINE_INTERVAL_3MINUTE: '3T',
+            self.KLINE_INTERVAL_5MINUTE: '5T',
+            self.KLINE_INTERVAL_15MINUTE: '15T',
             self.KLINE_INTERVAL_1HOUR: 'H',
             self.KLINE_INTERVAL_4HOUR: '4H',
             self.KLINE_INTERVAL_1DAY: 'D'
         }
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
 
     def has_more_data(self): return self.current_tick < self.total_ticks
     def _advance_tick(self): self.current_tick += 1
@@ -87,7 +98,8 @@ class MockBinanceClient:
                     {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
                 ).dropna()
                 if df_resampled.empty:
-                     logger.warning(f"Пустой срез свечей после resampling для {interval} в {current_timestamp}.")
+                     # (Это ожидаемо в начале, если данных 1м < 3м/5м/15м)
+                     # logger.warning(f"Пустой срез свечей после resampling для {interval} в {current_timestamp}.")
                      return []
                 df_resampled['timestamp'] = df_resampled.index.astype(np.int64) // 1_000_000
                 df_slice = df_resampled.iloc[-limit:]
@@ -96,7 +108,7 @@ class MockBinanceClient:
                 return []
 
         if df_slice is None or df_slice.empty:
-            logger.warning(f"Пустой срез свечей возвращен для {interval} в {current_timestamp} (после resampling).")
+            # logger.warning(f"Пустой срез свечей возвращен для {interval} в {current_timestamp} (после resampling).")
             return []
         
         klines = [[int(row.timestamp), str(row.open), str(row.high), str(row.low), str(row.close), str(row.volume), 0,0,0,0,0,0] for _, row in df_slice.iterrows()]
@@ -129,6 +141,18 @@ class MockBinanceClient:
             execution_price = Decimal(str(current_candle['open']))
 
         quantity = Decimal(str(quantity))
+
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.0 Slippage) ***
+        # (Симуляция проскальзывания 0.01% - 0.05%)
+        slippage_rate = Decimal(str(random.uniform(0.0001, 0.0005)))
+        if side == self.SIDE_BUY:
+            # (Покупаем дороже)
+            execution_price = execution_price * (Decimal('1') + slippage_rate)
+        elif side == self.SIDE_SELL:
+            # (Продаем дешевле)
+            execution_price = execution_price * (Decimal('1') - slippage_rate)
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+
         notional = execution_price * quantity
         commission = notional * self.commission_rate
         commission_asset = self.quote_asset

@@ -38,7 +38,7 @@ except ImportError:
     exit()
 
 # --- Импорт кастомных классов из других файлов ---
-# (Предполагается, что trading_bot.py - это v9.9)
+# (v1.0 Scalp)
 from trading_bot import TradingBot 
 from mock_binance_client import MockBinanceClient
 
@@ -47,7 +47,8 @@ from mock_binance_client import MockBinanceClient
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Multi-Strategy Trader v9.9 (Configurable + Filters)")
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Обновлен заголовок ***
+        self.root.title("Scalping Bot v1.0 (2025 Filters)")
         self.root.geometry("1440x900") # Ширина x Высота
         self.root.bind("<Configure>", self._resize_columns)
         self.event_queue = queue.Queue()
@@ -133,16 +134,19 @@ class App:
         tk.Label(settings_frame, text="Риск на сделку (%):").grid(row=2, column=0, sticky="w", padx=3, pady=3)
         self.risk_per_trade_var = tk.StringVar(value="1"); ttk.Entry(settings_frame, textvariable=self.risk_per_trade_var, width=8).grid(row=2, column=1, sticky="w", padx=3, pady=3)
         tk.Label(settings_frame, text="Базовый R/R:").grid(row=3, column=0, sticky="w", padx=3, pady=3)
-        # *** ИЗМЕНЕНИЕ (v9.9): Обновлено значение по умолчанию до 2.0 ***
-        self.rr_ratio_var = tk.StringVar(value="2.0"); ttk.Entry(settings_frame, textvariable=self.rr_ratio_var, width=8).grid(row=3, column=1, sticky="w", padx=3, pady=3)
+        
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): R/R по умолчанию 1.2 ***
+        self.rr_ratio_var = tk.StringVar(value="1.2"); ttk.Entry(settings_frame, textvariable=self.rr_ratio_var, width=8).grid(row=3, column=1, sticky="w", padx=3, pady=3)
 
-        # --- ФРЕЙМ: Конфигурация стратегий ---
+        # --- ФРЕЙМ: Конфигурация стратегий (v1.0 Scalp) ---
         strategy_config_frame = ttk.LabelFrame(scrollable_frame, text="Активные стратегии"); 
         strategy_config_frame.pack(fill="x", padx=3, pady=5, ipady=3)
         
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Новые стратегии ***
         self.strategy_display_names = {
-            "RSI_DIVERGENCE": "Swing (RSI Div)", "PRICE_ACTION": "Swing (PA 1H)", "EMA_CROSS": "Swing (EMA Cross)",
-            "MEAN_REVERSION": "Mean Rev (BB 4H)", "BREAKOUT_4H": "Breakout (KC 4H)", "MOMENTUM_1H": "Momentum (1H)"
+            "SCALP_LIQUIDITY_SWEEP_3M": "Scalp (Sweep 3M)", 
+            "SCALP_RSI_VOLUME_5M": "Scalp (RSI + Vol 5M)", 
+            "SCALP_BREAKOUT_CONFIRM_1M": "Scalp (Breakout 1M)"
         }
         
         for stype, name in self.strategy_display_names.items():
@@ -172,11 +176,7 @@ class App:
             ttk.Label(dashboard_frame, text=text).grid(row=i, column=0, sticky="w", padx=3, pady=2)
             self.dashboard_labels[key] = ttk.Label(dashboard_frame, text="N/A", font=("Arial", 9, "bold"), anchor="e"); self.dashboard_labels[key].grid(row=i, column=1, sticky="ew", padx=3, pady=2)
         
-        indicators_frame = ttk.LabelFrame(scrollable_frame, text="Рыночные Показатели (4H)"); indicators_frame.pack(fill="x", padx=3, pady=5, ipady=3); indicators_frame.columnconfigure(1, weight=1)
-        ind_items = [("EMA 9:", "ema_9_4h"), ("EMA 21:", "ema_21_4h"), ("EMA 50:", "ema_50_4h"), ("EMA 200:", "ema_200_4h"), ("RSI 14:", "rsi_14_4h"), ("ATR 14:", "atr_14_4h")]
-        for i, (text, key) in enumerate(ind_items):
-            ttk.Label(indicators_frame, text=text).grid(row=i, column=0, sticky="w", padx=3, pady=2)
-            self.dashboard_labels[key] = ttk.Label(indicators_frame, text="N/A", font=("Arial", 9, "bold"), anchor="e"); self.dashboard_labels[key].grid(row=i, column=1, sticky="ew", padx=3, pady=2)
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Удалена панель индикаторов 4H ***
         
         self.strategy_stats_frame = ttk.LabelFrame(scrollable_frame, text="Статистика по Стратегиям"); self.strategy_stats_frame.pack(fill="x", padx=3, pady=5, ipady=3)
         self.strategy_stats_frame.columnconfigure(1, weight=1); self.strategy_stats_frame.columnconfigure(2, weight=1)
@@ -185,6 +185,7 @@ class App:
         ttk.Label(self.strategy_stats_frame, text="PnL ($)", font=("Arial", 9, "bold"), anchor="e").grid(row=0, column=1, sticky="ew", padx=3, pady=2)
         ttk.Label(self.strategy_stats_frame, text="W/R (W/L)", font=("Arial", 9, "bold"), anchor="e").grid(row=0, column=2, sticky="ew", padx=3, pady=2)
         i = 1
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Обновление статистики для новых стратегий ***
         for stype, name in self.strategy_display_names.items():
             ttk.Label(self.strategy_stats_frame, text=f"{name}:").grid(row=i, column=0, sticky="w", padx=3, pady=1)
             lbl_pnl = ttk.Label(self.strategy_stats_frame, text="N/A", font=("Arial", 8), anchor="e"); lbl_pnl.grid(row=i, column=1, sticky="ew", padx=3, pady=1)
@@ -221,14 +222,14 @@ class App:
         # (Эта функция без изменений)
         try:
             if not 0 < float(self.risk_per_trade_var.get()) <= 10: raise ValueError("Risk must be 0-10")
-            # *** ИЗМЕНЕНИЕ (v9.9): Проверка R:R >= 2.0 (согласно новой логике) ***
-            if not float(self.rr_ratio_var.get()) >= 2.0: raise ValueError("R:R must be >= 2.0")
+            # *** ИЗМЕНЕНИЕ (v1.0 Scalp): R:R >= 1.0 ***
+            if not float(self.rr_ratio_var.get()) >= 1.0: raise ValueError("R:R must be >= 1.0")
             datetime.strptime(self.start_date_var.get(), '%Y-%m-%d')
         except ValueError as e: 
             if "R:R" in str(e):
-                messagebox.showerror("Ошибка", "Базовый R:R должен быть числом >= 2.0 (согласно новой логике v9.9).")
+                messagebox.showerror("Ошибка", "Базовый R:R должен быть числом >= 1.0 (для скальпинга).")
             else:
-                messagebox.showerror("Ошибка", "Риск должен быть числом (0-10), R:R >= 2.0, дата в формате YYYY-MM-DD.")
+                messagebox.showerror("Ошибка", "Риск должен быть числом (0-10), R:R >= 1.0, дата в формате YYYY-MM-DD.")
             return False
         if not self.symbol_var.get().strip(): messagebox.showerror("Ошибка", "Пожалуйста, введите торговую пару."); return False
         return True
@@ -287,7 +288,15 @@ class App:
             
             self.event_queue.put({'type': 'log', 'data': "Данные 1М загружены. Бэктест будет использовать 'lookahead-free' симулятор."})
             user_start_date = datetime.strptime(self.start_date_var.get(), '%Y-%m-%d').replace(tzinfo=UTC)
+            
+            # (Разогрев данных для 15M TF - 200 свечей * 15 мин = 3000 мин)
+            warmup_start_date = user_start_date - timedelta(minutes=4000)
+            
+            # (Данные для итерации)
             df_1m_test_iterator = df_1m[df_1m['datetime'] >= user_start_date].reset_index(drop=True)
+            # (Все данные, включая разогрев, для get_klines)
+            df_1m_all_data_for_htf = df_1m[df_1m['datetime'] >= warmup_start_date].reset_index(drop=True)
+
 
             if df_1m_test_iterator.empty:
                 self.event_queue.put({'type': 'log', 'data': f"КРИТИЧЕСКАЯ ОШИБКА: Не найдено 1-минутных данных для начала теста с {self.start_date_var.get()}."})
@@ -295,7 +304,7 @@ class App:
 
             symbol_str = self.symbol_var.get().upper()
             mock_client = MockBinanceClient(
-                iterator_df=df_1m_test_iterator, all_1m_data=df_1m, initial_usdt_balance=initial_balance, 
+                iterator_df=df_1m_test_iterator, all_1m_data=df_1m_all_data_for_htf, initial_usdt_balance=initial_balance, 
                 symbol=symbol_str, base_asset=symbol_str.replace("USDT", ""), 
                 quote_asset="USDT", commission_rate=Decimal('0.001')
             )
@@ -330,8 +339,12 @@ class App:
         # (Эта функция без изменений)
         self.event_queue.put({'type': 'log', 'data': f"Загрузка минутных данных для {symbol} с {start_date_str}..."})
         try:
-            user_start_date = datetime.strptime(start_date_str, '%Y-%m-%d').replace(tzinfo=UTC); warmup_days = 250
-            self.event_queue.put({'type': 'log', 'data': f"INFO: Загружаю данные за {warmup_days} дней до даты старта для 'разогрева' индикаторов..."})
+            user_start_date = datetime.strptime(start_date_str, '%Y-%m-%d').replace(tzinfo=UTC); 
+            
+            # (Scalp: уменьшаем разогрев до ~3 дней (4000 минут) + 250 дней для 1D EMA)
+            warmup_days = 250
+            
+            self.event_queue.put({'type': 'log', 'data': f"INFO: Загружаю данные за {warmup_days} дней до даты старта для 'разогрева' индикаторов (1D EMA)..."})
             data_load_start_date = user_start_date - timedelta(days=warmup_days); end_date = datetime.now(UTC); date_ranges = []; current_start = data_load_start_date
             while current_start < end_date:
                 current_end = current_start + relativedelta(months=1)

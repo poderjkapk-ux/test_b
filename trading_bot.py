@@ -32,7 +32,7 @@ except ImportError:
 STATE_FILE = "bot_state_multi_strategy.json"
 
 
-# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v9.10 2025 Filters) ---
+# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v1.0 Scalping 2025) ---
 class TradingBot(threading.Thread):
     
     def __init__(self, api_key, api_secret, event_queue, risk_per_trade, rr_ratio, symbol, active_strategies_config, backtest_client=None):
@@ -41,12 +41,12 @@ class TradingBot(threading.Thread):
         self.api_key, self.api_secret, self.event_queue = api_key, api_secret, event_queue
         try:
             self.base_risk_per_trade = Decimal(str(risk_per_trade)) / 100
-            # *** ИЗМЕНЕНИЕ (v9.9): Минимальный RR повышен до 2.0 по рекомендации 2025 ***
-            self.base_rr_ratio = Decimal('2.0') # (Было 1.3)
+            # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Минимальный RR для скальпинга (может быть 1.0) ***
+            self.base_rr_ratio = Decimal(str(rr_ratio)) # (Например, 1.0 или 1.2)
         except (ValueError, TypeError):
             self.log("Ошибка: риск и R/R должны быть числами. Используются значения по умолчанию.")
             self.base_risk_per_trade = Decimal('0.01')
-            self.base_rr_ratio = Decimal('2.0')
+            self.base_rr_ratio = Decimal('1.0')
 
         self.symbol = symbol.upper()
         self.stop_event = threading.Event()
@@ -85,10 +85,9 @@ class TradingBot(threading.Thread):
         self.current_trade_id = None
         self.current_trade_pnl = Decimal('0.0')
 
-        # --- Статистика по стратегиям ---
+        # --- Статистика по стратегиям (SCALPING) ---
         self.strategy_types = [
-            "RSI_DIVERGENCE", "PRICE_ACTION", "EMA_CROSS", 
-            "MEAN_REVERSION", "BREAKOUT_4H", "MOMENTUM_1H", "UNKNOWN"
+            "SCALP_LIQUIDITY_SWEEP_3M", "SCALP_RSI_VOLUME_5M", "SCALP_BREAKOUT_CONFIRM_1M", "UNKNOWN"
         ]
         self.pnl_by_strategy = {stype: Decimal('0.0') for stype in self.strategy_types}
         self.wins_by_strategy = {stype: 0 for stype in self.strategy_types}
@@ -99,19 +98,18 @@ class TradingBot(threading.Thread):
         self.step_size, self.qty_precision, self.price_precision = Decimal('0.0001'), 4, 2
         self.commission_rate, self.min_notional = Decimal('0.001'), Decimal('10.0')
 
-        # --- Параметры индикаторов ---
-        self.ema_superfast_len, self.ema_fast_len, self.ema_slow_len, self.ema_trend_len = 9, 21, 50, 200
+        # --- Параметры индикаторов (SCALPING) ---
+        self.ema_scalp_fast_len = 5
+        self.ema_scalp_slow_len = 10
+        self.ema_trend_len = 200
         self.atr_period = 14 
-        # *** ИЗМЕНЕНИЕ (v9.9): Множитель SL для Mean Reversion увеличен до 2.0 (по предложению) ***
-        self.atr_multiplier_sl = Decimal('2.0') # Множитель для Mean Reversion (Был 1.5 в v9.7)
-        self.atr_multiplier_trail = Decimal('2.0')
-        self.bb_len, self.bb_std = 20, 2.0
-        self.kc_len, self.kc_scalar = 20, 2.0
+        self.atr_multiplier_trail = Decimal('2.0') # Трейлинг по умолчанию
         self.adx_len = 14
         self.vol_sma_len = 20
+        # MACD/StochRSI параметры используются по умолчанию в pandas_ta
         
         self.last_heartbeat_log_time = time.time()
-        self.last_hour_checked = None
+        self.last_hour_checked = None # Используем для 1-минутных проверок
 
     def _save_state(self):
         # (Эта функция без изменений)
@@ -139,7 +137,7 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось сохранить состояние бота: {e}")
 
     def _load_state(self):
-        # (Эта функция без изменений)
+        # (Эта функция без изменений, но инициализирует новые типы стратегий)
         if self.is_backtest or not os.path.exists(STATE_FILE): return
         try:
             with open(STATE_FILE, 'r') as f: state = json.load(f)
@@ -170,6 +168,8 @@ class TradingBot(threading.Thread):
             self.loss_trades = state.get('loss_trades', 0)
             self.trade_counter = state.get('trade_counter', 0)
             self.current_trade_id = state.get('current_trade_id', None)
+            
+            # (Обновлено для новых стратегий)
             pnl_by_strategy_str = state.get('pnl_by_strategy', {})
             self.pnl_by_strategy = {stype: Decimal(pnl_by_strategy_str.get(stype, '0.0')) for stype in self.strategy_types}
             self.wins_by_strategy = state.get('wins_by_strategy', {stype: 0 for stype in self.strategy_types})
@@ -178,13 +178,14 @@ class TradingBot(threading.Thread):
                 if stype not in self.pnl_by_strategy: self.pnl_by_strategy[stype] = Decimal('0.0')
                 if stype not in self.wins_by_strategy: self.wins_by_strategy[stype] = 0
                 if stype not in self.losses_by_strategy: self.losses_by_strategy[stype] = 0
+                
             self.log("Состояние бота успешно загружено.")
             if self.position_side: self.log(f"Загружена активная позиция: {self.position_side} {self.quantity} {self.base_asset}")
         except Exception as e: self.log(f"ОШИБКА: Не удалось загрузить состояние бота: {e}")
 
     def run(self):
-        # *** ИЗМЕНЕНИЕ (v9.10): Обновлена версия ***
-        bot_name = "Multi-Strategy Trader v9.10 (2025 Filters)"
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp) ***
+        bot_name = "Scalping Bot v1.0 (2025 Filters)"
         mode = "БЭКТЕСТ (1M)" if self.is_backtest else "РЕАЛЬНАЯ ТОРГОВЛЯ" 
         self.log(f"Запуск бота '{bot_name}' в режиме '{mode}' для символа {self.symbol}...")
         
@@ -194,11 +195,13 @@ class TradingBot(threading.Thread):
             
         loop_condition = self.binance_client.has_more_data if self.is_backtest else lambda: not self.stop_event.is_set()
         tick_counter = 0 
+        
         while loop_condition():
             try:
                 current_time_dt = self._get_current_time()
-                current_hour = current_time_dt.replace(minute=0, second=0, microsecond=0)
-                should_check_logic = (self.last_hour_checked is None or current_hour > self.last_hour_checked)
+                # (Логика Scalp: проверяем на каждой 1М свече)
+                current_minute = current_time_dt.replace(second=0, microsecond=0)
+                should_check_logic = (self.last_hour_checked is None or current_minute > self.last_hour_checked)
 
                 if not self.is_connected and not self.is_backtest: self._handle_disconnection(); continue
 
@@ -209,6 +212,7 @@ class TradingBot(threading.Thread):
                     current_high = Decimal(str(current_1m_candle['high']))
                     current_low = Decimal(str(current_1m_candle['low']))
 
+                # (Получаем 1m, 3m, 5m, 15m, 1d)
                 market_data = self._get_market_data()
                 if not market_data: self._wait_or_continue(); continue
                 
@@ -216,14 +220,16 @@ class TradingBot(threading.Thread):
                 if not self.is_backtest:
                     current_high = current_price; current_low = current_price
                 
-                if not self.is_backtest or (tick_counter % 5 == 0):
+                if not self.is_backtest or (tick_counter % 1 == 0): # Обновляем GUI каждую минуту в бэктесте
                     self._update_dashboard_data(market_data, current_price)
                 
                 if should_check_logic:
-                    self.last_hour_checked = current_hour
-                    log_msg = f"--- Новая 1H свеча ({current_time_dt.strftime('%Y-%m-%d %H:%M')}). Обновление HTF данных... ---"
-                    if self.is_backtest and tick_counter > 0: self.log(log_msg)
-                    if not self.is_backtest: self.log(log_msg)
+                    self.last_hour_checked = current_minute
+                    # (Лог Scalp: каждую минуту)
+                    if tick_counter > 0: # Не логируем первый тик
+                        log_msg = f"--- Новая 1M свеча ({current_time_dt.strftime('%H:%M')}). Обновление STF данных... ---"
+                        if self.is_backtest: self.log(log_msg)
+                        if not self.is_backtest: self.log(log_msg)
                 
                 if self.position_side:
                     self._check_and_manage_exit_conditions(market_data, current_price, current_high, current_low, current_1m_candle) 
@@ -232,18 +238,21 @@ class TradingBot(threading.Thread):
                         if self.is_backtest: self.log("Баланс USDT исчерпан. Бэктест остановлен."); break
                         self.log(f"Торговля приостановлена. Недостаточно средств."); self._wait_or_continue(300); continue
                     
-                    best_signal = self._get_algorithmic_decision(market_data, current_price)
-                    
-                    if best_signal:
-                        self._calculate_and_open_position(best_signal, market_data)
-                    elif should_check_logic: 
-                        self.log("Анализ завершен: Нет сигналов, соответствующих Tier-системе (или R/R < 2.0).")
+                    # (Проверяем логику каждую минуту)
+                    if should_check_logic:
+                        best_signal = self._get_algorithmic_decision(market_data, current_price)
+                        
+                        if best_signal:
+                            self._calculate_and_open_position(best_signal, market_data)
+                        else: 
+                            # self.log("Анализ завершен: Нет сигналов.") # Слишком много спама для 1M
+                            pass
                     
                 current_time_seconds = time.time()
-                if not self.is_backtest and current_time_seconds - self.last_heartbeat_log_time > 300: 
+                if not self.is_backtest and current_time_seconds - self.last_heartbeat_log_time > 60: # Частый Heartbeat для скальпинга
                     self._log_heartbeat(market_data, current_price)
                     self.last_heartbeat_log_time = current_time_seconds
-                elif self.is_backtest and tick_counter % 240 == 0 and tick_counter > 0: 
+                elif self.is_backtest and tick_counter % 60 == 0 and tick_counter > 0: # Heartbeat каждый час в бэктесте
                     self._log_heartbeat(market_data, current_price)
             
             except (BinanceRequestException, requests.exceptions.RequestException) as e: 
@@ -278,10 +287,11 @@ class TradingBot(threading.Thread):
             self.log(f"Ошибка в логе Heartbeat: {e}")
 
     # ---
-    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v9.9 - R:R >= 2.0) ---
+    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v1.0 Scalp) ---
     # ---
     def _get_algorithmic_decision(self, market_data, current_price):
         
+        # (Фильтр 1D Тренда оставлен, т.к. одна из стратегий его использует)
         ind_1d = market_data.get('indicators_1d')
         is_1d_bull_trend = False
         if ind_1d is None or len(ind_1d) < self.ema_trend_len:
@@ -294,435 +304,255 @@ class TradingBot(threading.Thread):
         except ValueError:
             self.log("Предупреждение: Недопустимые данные в индикаторах 1D. Пропуск."); return None
 
-        self._log_daily_status(f"1D Тренд: {'' if is_1d_bull_trend else 'НЕ '}Бычий. Поиск сигналов...")
+        self._log_daily_status(f"1D Тренд: {'' if is_1d_bull_trend else 'НЕ '}Бычий. Поиск Scalp-сигналов...")
 
-        key_levels = self._get_key_levels(market_data['indicators_4h'])
+        # (Удален _get_key_levels)
 
         signals = {
-            "RSI_DIVERGENCE": None, "MEAN_REVERSION": None, "PRICE_ACTION": None,
-            "EMA_CROSS": None, "BREAKOUT_4H": None, "MOMENTUM_1H": None
+            "SCALP_LIQUIDITY_SWEEP_3M": None, 
+            "SCALP_RSI_VOLUME_5M": None, 
+            "SCALP_BREAKOUT_CONFIRM_1M": None
         }
         
-        if self.active_strategies.get("RSI_DIVERGENCE", False):
-            signals["RSI_DIVERGENCE"] = self._find_entry_rsi_divergence_4h(market_data, current_price)
-        if self.active_strategies.get("MEAN_REVERSION", False):
-            signals["MEAN_REVERSION"] = self._find_entry_mean_reversion_4h(market_data, current_price)
-        if self.active_strategies.get("PRICE_ACTION", False):
-            signals["PRICE_ACTION"] = self._find_entry_price_action_1h(market_data, current_price, key_levels)
-        if self.active_strategies.get("EMA_CROSS", False):
-            signals["EMA_CROSS"] = self._find_entry_ema_pullback_4h(market_data, current_price, key_levels, is_1d_bull_trend)
+        if self.active_strategies.get("SCALP_LIQUIDITY_SWEEP_3M", False):
+            signals["SCALP_LIQUIDITY_SWEEP_3M"] = self._find_entry_scalp_sweep_3m(market_data, current_price)
+        if self.active_strategies.get("SCALP_RSI_VOLUME_5M", False):
+            signals["SCALP_RSI_VOLUME_5M"] = self._find_entry_scalp_rsi_vol_5m(market_data, current_price)
+        if self.active_strategies.get("SCALP_BREAKOUT_CONFIRM_1M", False):
+            signals["SCALP_BREAKOUT_CONFIRM_1M"] = self._find_entry_scalp_breakout_1m(market_data, current_price)
         
-        if self.active_strategies.get("BREAKOUT_4H", False):
-            signals["BREAKOUT_4H"] = self._find_entry_breakout_retest_4h(market_data, current_price, key_levels, is_1d_bull_trend)
-        if self.active_strategies.get("MOMENTUM_1H", False):
-            signals["MOMENTUM_1H"] = self._find_entry_momentum_pullback_1h(market_data, current_price, key_levels, is_1d_bull_trend)
+        # --- УРОВЕНЬ 3: Скальпинг-Сигналы ---
+        # (Все стратегии имеют одинаковый приоритет (Tier 3), выбираем лучший R/R)
+        tier_3_signals = [signals["SCALP_LIQUIDITY_SWEEP_3M"], signals["SCALP_RSI_VOLUME_5M"], signals["SCALP_BREAKOUT_CONFIRM_1M"]]
         
-        # --- УРОВЕНЬ 1: Сигналы Разворота (Высший приоритет) ---
-        # *** ИЗМЕНЕНИЕ (v9.9): Проверка R/R >= self.base_rr_ratio (который теперь 2.0) ***
-        tier_1_signals = [signals["RSI_DIVERGENCE"], signals["MEAN_REVERSION"]]
-        valid_tier_1 = [s for s in tier_1_signals if s and s.get('rr_ratio', Decimal('0')) >= self.base_rr_ratio]
-        
-        if valid_tier_1:
-            best_signal = max(valid_tier_1, key=lambda x: x['rr_ratio'])
-            self.log(f"    -> ✅ ВЫБОР (TIER 1 - Разворот): {best_signal['type']} (R/R: {best_signal['rr_ratio']:.2f}:1)")
-            return best_signal
-
-        # --- УРОВЕНЬ 2: Сигналы Подтверждения (Средний приоритет) ---
-        tier_2_signal = signals["PRICE_ACTION"]
-        if tier_2_signal and tier_2_signal.get('rr_ratio', Decimal('0')) >= self.base_rr_ratio:
-            best_signal = tier_2_signal
-            self.log(f"    -> ✅ ВЫБОР (TIER 2 - PA Подтверждение): {best_signal['type']} (R/R: {best_signal['rr_ratio']:.2f}:1)")
-            return best_signal
-
-        # --- УРОВЕНЬ 3: Сигналы "По Тренду" (Низший приоритет) ---
-        tier_3_signals = [signals["EMA_CROSS"], signals["BREAKOUT_4H"], signals["MOMENTUM_1H"]]
+        # (Проверяем R/R >= self.base_rr_ratio, который теперь 1.0 или 1.2)
         valid_tier_3 = [s for s in tier_3_signals if s and s.get('rr_ratio', Decimal('0')) >= self.base_rr_ratio]
         
         if valid_tier_3:
+            # Выбираем сигнал с наилучшим R/R
             best_signal = max(valid_tier_3, key=lambda x: x['rr_ratio'])
-            self.log(f"    -> ✅ ВЫБОР (TIER 3 - По тренду): {best_signal['type']} (R/R: {best_signal['rr_ratio']:.2f}:1)")
+            self.log(f"    -> ✅ ВЫБОР (TIER 3 - Scalp): {best_signal['type']} (R/R: {best_signal['rr_ratio']:.2f}:1)")
             return best_signal
         
         return None
 
-    
-    def _get_key_levels(self, ind_4h):
-        # (без изменений)
-        levels = {'supports': [], 'resistances': []}
-        if ind_4h is None or len(ind_4h) < 60: return levels
-        recent_data = ind_4h.iloc[-60:]
-        supports = recent_data[(recent_data['low'] < recent_data['low'].shift(1)) & (recent_data['low'] < recent_data['low'].shift(-1))]
-        resistances = recent_data[(recent_data['high'] > recent_data['high'].shift(1)) & (recent_data['high'] > recent_data['high'].shift(-1))]
-        levels['supports'] = sorted([Decimal(str(s_val)) for s_val in supports['low'].values], reverse=True)
-        levels['resistances'] = sorted([Decimal(str(r_val)) for r_val in resistances['high'].values])
-        return levels
-
     # ---
-    # --- СТРАТЕГИИ (v9.10 - 2025 Filters) ---
+    # --- (УДАЛЕНЫ СТАРЫЕ СТРАТЕГИИ И _get_key_levels) ---
     # ---
 
-    def _find_entry_ema_pullback_4h(self, market_data, current_price, key_levels, is_1d_bull_trend):
-        # (ИЗМЕНЕНО v9.10: Используем Vol/ATR)
-        if not is_1d_bull_trend:
+    # ---
+    # --- НОВЫЕ СТРАТЕГИИ (v1.0 Scalp) ---
+    # ---
+
+    def _find_entry_scalp_sweep_3m(self, market_data, current_price):
+        ind_3m = market_data.get('indicators_3m')
+        ind_15m = market_data.get('indicators_15m')
+        if ind_3m is None or ind_15m is None or len(ind_3m) < 21 or len(ind_15m) < self.ema_trend_len:
             return None
-        ind_4h = market_data.get('indicators_4h')
-        ind_1h = market_data.get('indicators_1h')
-        if ind_4h is None or ind_1h is None or len(ind_4h) < self.ema_slow_len or len(ind_1h) < (self.vol_sma_len + 1): return None
-        last_4h = ind_4h.iloc[-1]
-        try:
-            ema9_4h = Decimal(str(last_4h[f'EMA_{self.ema_superfast_len}']))
-            ema21_4h = Decimal(str(last_4h[f'EMA_{self.ema_fast_len}']))
-            ema50_4h = Decimal(str(last_4h[f'EMA_{self.ema_slow_len}']))
-            atr_4h = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
-            adx_4h = Decimal(str(last_4h[f'ADX_{self.adx_len}']))
-            if adx_4h < 25: 
-                self.log("    -> ОТКЛОНЕНО (EMA Cross): ADX < 25, тренд 4H слишком слабый."); return None
-        except (ValueError, KeyError): return None
-        if not (ema9_4h > ema21_4h and ema21_4h > ema50_4h): return None
-        is_in_zone = (ema50_4h * Decimal('0.998')) < current_price < (ema9_4h * Decimal('1.002'))
-        if not is_in_zone: return None
-        signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
-        is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
-        if not (is_hammer or is_engulfing): return None
         
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: Vol/ATR) ***
+        # 1. Глобальный фильтр (15m TF)
         try:
-            # Используем нормализованный объем (по предложению 2025)
-            signal_norm_vol_1h = Decimal(str(signal_1h['norm_volume']))
-            avg_norm_vol_1h = Decimal(str(prev_1h[f'NORM_VOL_SMA_{self.vol_sma_len}'])) # Среднее с *предыдущей* свечи
+            price_15m = Decimal(str(ind_15m.iloc[-1]['close']))
+            ema200_15m = Decimal(str(ind_15m.iloc[-1][f'EMA_{self.ema_trend_len}']))
+            if price_15m <= ema200_15m:
+                # self.log("    -> ОТКЛОНЕНО (SWEEP 3M): Цена ниже EMA 200 на 15M.")
+                return None
+        except (ValueError, KeyError): return None
+        
+        # 2. Анализ 3M
+        try:
+            recent_data = ind_3m.iloc[-20:] # Данные за 20 свечей (1 час)
+            last_candle = ind_3m.iloc[-1]
             
-            rsi_1h = Decimal(str(signal_1h['RSI_14']))
-            if signal_norm_vol_1h <= avg_norm_vol_1h: 
-                self.log("    -> ОТКЛОНЕНО (EMA Cross): Низкий нормализованный объем (Vol/ATR) на 1H PA свече."); return None
-            if rsi_1h < 50:
-                self.log("    -> ОТКЛОНЕНО (EMA Cross): RSI < 50 на 1H PA свече."); return None
-        except (ValueError, KeyError): return None
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
-
-        entry_price = current_price
-        
-        # (v9.9 Smart SL): Множитель 1.5 (по предложению)
-        stop_loss_price = self._round_price(ema50_4h - (atr_4h * Decimal('1.5'))) # Ставим SL на 1.5 ATR ниже EMA 50
-        
-        risk_per_coin = entry_price - stop_loss_price
-        if risk_per_coin <= 0: return None
-        target_tp = self._get_next_resistance(key_levels, entry_price)
-        if not target_tp: return None
-        reward_per_coin = target_tp - entry_price
-        if reward_per_coin <= 0: return None
-        rr_ratio = reward_per_coin / risk_per_coin
-        self.log(f"    -> Кандидат (EMA Pullback): 1H паттерн (Vol/ATR+, RSI>50) на 4H EMA (ADX>25). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
-        return {"type": "EMA_CROSS", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
-
-    def _find_entry_rsi_divergence_4h(self, market_data, current_price):
-        # (ИЗМЕНЕНО v9.9: Добавлен ADX < 25, MACD Hist > 0, ATR SL 1.5)
-        ind_4h = market_data.get('indicators_4h')
-        if ind_4h is None or len(ind_4h) < 40: return None
-        lookback_period = 30
-        recent_data = ind_4h.iloc[-lookback_period:]
-        rsi_lows = recent_data[(recent_data['RSI_14'] < recent_data['RSI_14'].shift(1)) & (recent_data['RSI_14'] < recent_data['RSI_14'].shift(-1))]
-        if len(rsi_lows) < 2: return None
-        last_rsi_low_val, prev_rsi_low_val = rsi_lows.iloc[-1]['RSI_14'], rsi_lows.iloc[-2]['RSI_14']
-        last_rsi_low_idx, prev_rsi_low_idx = rsi_lows.index[-1], rsi_lows.index[-2]
-        if not (prev_rsi_low_val < 45): return None
-        if not (last_rsi_low_val > prev_rsi_low_val): return None # Regular Bullish Div
-        price_at_last_rsi_low, price_at_prev_rsi_low = recent_data.loc[last_rsi_low_idx]['low'], recent_data.loc[prev_rsi_low_idx]['low']
-        if not (price_at_last_rsi_low < price_at_prev_rsi_low): return None
-        is_recent_divergence = (ind_4h.index[-1] - last_rsi_low_idx) <= 5
-        if not is_recent_divergence: return None
-        
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.9 Filters) ***
-        try:
-            last_4h = ind_4h.iloc[-1]
-            adx_4h = Decimal(str(last_4h[f'ADX_{self.adx_len}']))
-            macd_hist_4h = Decimal(str(last_4h['MACDh_12_26_9']))
-            if adx_4h > 25: 
-                self.log("    -> ОТКЛОНЕНО (RSI Div): ADX > 25, не похоже на разворот."); return None
-            if macd_hist_4h < 0: 
-                self.log("    -> ОТКЛОНЕНО (RSI Div): MACD Histogram < 0, нет подтверждения."); return None
-        except (ValueError, KeyError): return None
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
-
-        entry_price = current_price
-        stop_loss_ref_candle = recent_data.loc[last_rsi_low_idx]
-        
-        try:
-            atr_4h = Decimal(str(stop_loss_ref_candle[f'ATRr_{self.atr_period}']))
-            divergence_low = Decimal(str(stop_loss_ref_candle['low']))
-        except (KeyError, ValueError): return None
-        
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.9 Smart SL): Множитель 1.5 (по предложению) ***
-        stop_loss_price = self._round_price(divergence_low - (atr_4h * Decimal('1.5'))) # Ставим SL на 1.5 ATR ниже минимума дивергенции
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
-        
-        risk_per_coin = entry_price - stop_loss_price
-        if risk_per_coin <= 0: return None
-        target_tp = self._round_price(Decimal(str(recent_data.loc[prev_rsi_low_idx]['high'])))
-        reward_per_coin = target_tp - entry_price
-        if reward_per_coin <= 0: return None
-        rr_ratio = reward_per_coin / risk_per_coin
-        self.log(f"    -> Кандидат (RSI Divergence): 4H дивергенция (ADX<25, MACD+). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
-        return {"type": "RSI_DIVERGENCE", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
-
-    def _find_entry_price_action_1h(self, market_data, current_price, key_levels):
-       # (ИЗМЕНЕНО v9.10: Используем Vol/ATR)
-       ind_1h = market_data.get('indicators_1h')
-       if ind_1h is None or len(ind_1h) < (self.vol_sma_len + 1): return None
-       signal_candle, prev_candle = ind_1h.iloc[-1], ind_1h.iloc[-2]
-       is_hammer, is_engulfing = self._is_bullish_hammer(signal_candle), self._is_bullish_engulfing(prev_candle, signal_candle)
-       if not (is_hammer or is_engulfing): return None
-       
-       # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: Vol/ATR) ***
-       try:
-           rsi_1h = Decimal(str(signal_candle['RSI_14']))
-           
-           # Используем нормализованный объем (по предложению 2025)
-           avg_norm_volume = Decimal(str(prev_candle[f'NORM_VOL_SMA_{self.vol_sma_len}'])) # Среднее с *предыдущей* свечи
-           signal_norm_volume = Decimal(str(signal_candle['norm_volume']))
-           
-           atr_1h = Decimal(str(signal_candle[f'ATRr_{self.atr_period}']))
-           signal_low = Decimal(str(signal_candle['low']))
-           atr_perc = (atr_1h / current_price) * 100 if current_price > 0 else Decimal('0')
-           
-           adx_1h = Decimal(str(signal_candle[f'ADX_{self.adx_len}']))
-           if adx_1h > 20: 
-               self.log("    -> ОТКЛОНЕНО (PA 1H): ADX > 20, рынок в тренде, а не в 'range'."); return None
-       except (ValueError, KeyError): return None
-       # *** КОНЕЦ ИЗМЕНЕНИЯ ***
-       
-       if rsi_1h <= 40 or rsi_1h >= 70: return None
-       is_near_support = any(abs(current_price - support) / support < Decimal('0.02') for support in key_levels['supports'])
-       if not is_near_support: return None
-       
-       # *** ИЗМЕНЕНИЕ (v9.10): Проверка нормализованного объема ***
-       if signal_norm_volume <= avg_norm_volume: 
-           self.log("    -> ОТКЛОНЕНО (PA 1H): Низкий нормализованный объем (Vol/ATR) на сигнальной свече."); return None
-       if atr_perc > 3: return None
-       
-       entry_price = current_price
-       
-       # (v9.7 Smart SL) - Без изменений (1.0 ATR)
-       stop_loss_price = self._round_price(signal_low - (atr_1h * Decimal('1.0')))
-       
-       risk_per_coin = entry_price - stop_loss_price
-       if risk_per_coin <= 0: return None
-       target_tp = self._get_next_resistance(key_levels, entry_price)
-       if not target_tp: return None
-       reward_per_coin = target_tp - entry_price
-       if reward_per_coin <= 0: return None
-       rr_ratio = reward_per_coin / risk_per_coin
-       pattern_type = "hammer" if is_hammer else "engulfing"
-       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type} (ADX<20, Vol/ATR+), у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
-       return {"type": "PRICE_ACTION", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
-
-    def _find_entry_mean_reversion_4h(self, market_data, current_price):
-        # (ИЗМЕНЕНО v9.10: Добавлены MACD+ и DI+ > DI- фильтры)
-        ind_4h = market_data.get('indicators_4h')
-        if ind_4h is None or len(ind_4h) < (self.bb_len + 1): return None
-        last_4h = ind_4h.iloc[-1]
-        try:
-            adx = Decimal(str(last_4h[f'ADX_{self.adx_len}']))
-            rsi = Decimal(str(last_4h['RSI_14']))
-            low_price = Decimal(str(last_4h['low']))
-            lower_bb = Decimal(str(last_4h[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
-            middle_bb = Decimal(str(last_4h[f'BBM_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
-            atr_4h = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
-            # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10): Доп. фильтры (по предложению 2025) ***
-            di_plus = Decimal(str(last_4h[f'DMP_{self.adx_len}']))
-            di_minus = Decimal(str(last_4h[f'DMN_{self.adx_len}']))
-            macd_hist = Decimal(str(last_4h['MACDh_12_26_9']))
-            # *** КОНЕЦ ИЗМЕНЕНИЯ ***
-        except (ValueError, KeyError): return None
-        
-        # (v9.9 Filter): ADX < 20
-        if adx >= 20: 
-            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): ADX ({adx:.1f}) >= 20, рынок в тренде."); return None
-        
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10): Доп. фильтры (по предложению 2025) ***
-        if macd_hist < 0:
-            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): MACD Hist ({macd_hist:.2f}) < 0, нет бычьего подтверждения."); return None
-        if di_plus <= di_minus:
-            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): DI+ ({di_plus:.1f}) <= DI- ({di_minus:.1f}), нет бычьего направления."); return None
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
-
-        # (v9.9 Filter): RSI < 30
-        if rsi >= 30: 
-            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): RSI ({rsi:.1f}) >= 30, не в зоне 'oversold'."); return None
-
-        is_pierced = low_price < (lower_bb * Decimal('0.995'))
-        is_at_band = (current_price >= lower_bb) and (low_price < lower_bb)
-        if not (is_pierced or is_at_band): return None
-        entry_price = current_price
-        
-        # (v9.9 Smart SL): Множитель 2.0 (через self.atr_multiplier_sl)
-        stop_loss_price = self._round_price(low_price - (atr_4h * self.atr_multiplier_sl)) # Используем self.atr_multiplier_sl = 2.0
-        
-        risk_per_coin = entry_price - stop_loss_price
-        if risk_per_coin <= 0: return None
-        target_tp = self._round_price(middle_bb)
-        reward_per_coin = target_tp - entry_price
-        if reward_per_coin <= 0: return None
-        rr_ratio = reward_per_coin / risk_per_coin
-        # *** ИЗМЕНЕНИЕ (v9.10): Обновлен лог ***
-        self.log(f"    -> Кандидат (Mean Reversion): Возврат в BB (ADX<20, RSI<30, MACD+, DI+). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
-        return {"type": "MEAN_REVERSION", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
-
-    def _find_entry_breakout_retest_4h(self, market_data, current_price, key_levels, is_1d_bull_trend):
-        # (ИЗМЕНЕНО v9.10: Используем Vol/ATR)
-        if not is_1d_bull_trend: return None
-        ind_4h = market_data.get('indicators_4h')
-        ind_1h = market_data.get('indicators_1h')
-        if ind_4h is None or ind_1h is None or len(ind_4h) < 30 or len(ind_1h) < (self.vol_sma_len + 1): return None
-        
-        prev_4h = ind_4h.iloc[-2]
-        signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
-        
-        try:
-            prev_close = Decimal(str(prev_4h['close']))
-            prev_upper_kc = Decimal(str(prev_4h[f'KCUe_{self.kc_len}_{self.kc_scalar}']))
-            signal_1h_low = Decimal(str(signal_1h['low']))
-            atr_1h = Decimal(str(signal_1h[f'ATRr_{self.atr_period}']))
-        except (ValueError, KeyError, IndexError): return None
-        
-        is_breakout_candle = (prev_close > prev_upper_kc)
-        if not is_breakout_candle: return None
-        
-        retest_level = prev_upper_kc
-        is_in_retest_zone = (retest_level * Decimal('0.995') < current_price < retest_level * Decimal('1.015'))
-        if not is_in_retest_zone: return None
-        
-        is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
-        if not (is_hammer or is_engulfing): return None
-        
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: Vol/ATR) ***
-        try:
-            # Используем нормализованный объем (по предложению 2025)
-            signal_norm_vol_1h = Decimal(str(signal_1h['norm_volume']))
-            avg_norm_vol_1h = Decimal(str(prev_1h[f'NORM_VOL_SMA_{self.vol_sma_len}'])) # Среднее с *предыдущей* свечи
+            # (Sweep Detection)
+            lookback_low = Decimal(str(ind_3m.iloc[-6:-1]['low'].min())) # Low за 5 предыдущих свечей
+            current_low = Decimal(str(last_candle['low']))
+            current_close = Decimal(str(last_candle['close']))
+            current_open = Decimal(str(last_candle['open']))
             
-            if signal_norm_vol_1h <= avg_norm_vol_1h: 
-                self.log("    -> ОТКЛОНЕНО (Breakout): Низкий нормализованный объем (Vol/ATR) на 1H PA свече ретеста."); return None
-        except (ValueError, KeyError): return None
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+            is_sweep = (current_low < lookback_low) and (current_close > current_open)
+            if not is_sweep: return None
 
-        entry_price = current_price
-        
-        # (v9.7 Smart SL) - Без изменений (1.0 ATR)
-        stop_loss_price = self._round_price(signal_1h_low - (atr_1h * Decimal('1.0')))
-        
-        risk_per_coin = entry_price - stop_loss_price
-        if risk_per_coin <= 0: return None
-        
-        target_tp = self._get_next_resistance(key_levels, entry_price)
-        if not target_tp: return None 
+            # (Momentum Confirmation)
+            ema_5 = Decimal(str(last_candle[f'EMA_{self.ema_scalp_fast_len}']))
+            ema_10 = Decimal(str(last_candle[f'EMA_{self.ema_scalp_slow_len}']))
+            macd_hist = Decimal(str(last_candle['MACDh_12_26_9']))
+            prev_macd_hist = Decimal(str(ind_3m.iloc[-2]['MACDh_12_26_9']))
             
-        reward_per_coin = target_tp - entry_price
-        if reward_per_coin <= 0: return None 
-            
-        rr_ratio = reward_per_coin / risk_per_coin
-        
-        max_rr_cap = Decimal('3.0') 
-        if rr_ratio > max_rr_cap:
-            self.log(f"    -> (Breakout) R/R ({rr_ratio:.2f}) превышает лимит {max_rr_cap}. Цель скорректирована.")
-            rr_ratio = max_rr_cap
-            reward_per_coin = risk_per_coin * rr_ratio
-            target_tp = self._round_price(entry_price + reward_per_coin)
-        
-        self.log(f"    -> Кандидат (Breakout & Retest): 1H паттерн (Vol/ATR+) на 4H KC ретесте. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
-        return {"type": "BREAKOUT_4H", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
+            is_momentum_ok = (ema_5 > ema_10) or (macd_hist > 0 and macd_hist > prev_macd_hist)
+            if not is_momentum_ok:
+                # self.log("    -> ОТКЛОНЕНО (SWEEP 3M): Sweep есть, но Momentum-фильтр (EMA 5>10 или MACD Hist > 0) не пройден.")
+                return None
 
-    def _find_entry_momentum_pullback_1h(self, market_data, current_price, key_levels, is_1d_bull_trend):
-        # (ИЗМЕНЕНО v9.10: ADX > 35)
-        if not is_1d_bull_trend: return None
-        ind_1h = market_data.get('indicators_1h')
-        ind_4h = market_data.get('indicators_4h')
-        if ind_1h is None or ind_4h is None or len(ind_1h) < 30 or len(ind_4h) < self.ema_slow_len:
+            # (Volume Filter)
+            norm_vol = Decimal(str(last_candle['norm_volume']))
+            avg_norm_vol = Decimal(str(last_candle[f'NORM_VOL_SMA_{self.vol_sma_len}']))
+            if norm_vol <= (avg_norm_vol * Decimal('1.3')):
+                # self.log(f"    -> ОТКЛОНЕНО (SWEEP 3M): Низкий Norm. Volume ({norm_vol:.2f} <= {avg_norm_vol*Decimal('1.3'):.2f})")
+                return None
+
+            # (Volatility Filter)
+            atr_14 = Decimal(str(last_candle[f'ATRr_{self.atr_period}']))
+            avg_atr_14 = Decimal(str(recent_data[f'ATRr_{self.atr_period}'].mean()))
+            if atr_14 <= avg_atr_14:
+                # self.log("    -> ОТКЛОНЕНО (SWEEP 3M): Низкая волатильность (ATR <= Avg ATR).")
+                return None
+
+        except (ValueError, KeyError, IndexError): 
             return None
-        last_4h = ind_4h.iloc[-1]
-        last_1h = ind_1h.iloc[-1]; prev_1h = ind_1h.iloc[-2]
-        try:
-            price_4h = Decimal(str(last_4h['close']))
-            ema_50_4h = Decimal(str(last_4h[f'EMA_{self.ema_slow_len}']))
-            if price_4h <= ema_50_4h: return None
-            ema_9_1h = Decimal(str(last_1h[f'EMA_{self.ema_superfast_len}']))
-            ema_21_1h = Decimal(str(last_1h[f'EMA_{self.ema_fast_len}']))
-            atr_1h = Decimal(str(last_1h[f'ATRr_{self.atr_period}'])) 
-            if ema_9_1h <= ema_21_1h: return None
-            
-            # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: ADX > 35) ***
-            adx_1h = Decimal(str(last_1h[f'ADX_{self.adx_len}']))
-            rsi_1h = Decimal(str(last_1h['RSI_14']))
-            # (v9.10): ADX > 35 (по предложению 2025)
-            if adx_1h < 35: 
-                self.log(f"    -> ОТКЛОНЕНО (Momentum): ADX ({adx_1h:.1f}) < 35, импульс не подтвержден."); return None
-            if rsi_1h < 50: 
-                self.log(f"    -> ОТКЛОНЕНО (Momentum): RSI ({rsi_1h:.1f}) < 50, нет бычьего моментума."); return None
-            # *** КОНЕЦ ИЗМЕНЕНИЯ ***
 
-            if current_price > (ema_21_1h * Decimal('1.003')): return None
-            stoch_k_1h = Decimal(str(last_1h['STOCHRSIk_14_14_3_3']))
-            stoch_d_1h = Decimal(str(last_1h['STOCHRSId_14_14_3_3']))
-            stoch_k_prev_1h = Decimal(str(prev_1h['STOCHRSIk_14_14_3_3']))
-            is_oversold_cross = (stoch_k_1h < 30) and (stoch_k_prev_1h <= stoch_d_1h) and (stoch_k_1h > stoch_d_1h)
-            if not is_oversold_cross: return None
-        except (ValueError, KeyError): return None
-        
         entry_price = current_price
         
-        # (v9.7 Smart SL) - Без изменений (1.0 ATR)
-        stop_loss_price = self._round_price(ema_21_1h - (atr_1h * Decimal('1.0'))) 
-        
+        # (SL: Entry - (ATR * 0.8))
+        sl_mult = Decimal('0.8')
+        stop_loss_price = self._round_price(entry_price - (atr_14 * sl_mult))
         risk_per_coin = entry_price - stop_loss_price
         if risk_per_coin <= 0: return None
+        
+        # (TP: R/R 1.2)
+        rr_mult = Decimal('1.2')
+        reward_per_coin = risk_per_coin * rr_mult
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = reward_per_coin / risk_per_coin
 
-        target_tp = self._get_next_resistance(key_levels, entry_price)
-        if not target_tp: 
-            return None 
+        if rr_ratio < Decimal('1.2'): return None # (Требование R/R >= 1.2)
 
-        reward_per_coin = target_tp - entry_price
-        if reward_per_coin <= 0: return None 
+        self.log(f"    -> Кандидат (SCALP_LIQUIDITY_SWEEP_3M): LONG на 3M (sweep + momentum + volume). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {"type": "SCALP_LIQUIDITY_SWEEP_3M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
+
+
+    def _find_entry_scalp_rsi_vol_5m(self, market_data, current_price):
+        ind_5m = market_data.get('indicators_5m')
+        if ind_5m is None or len(ind_5m) < (self.vol_sma_len + 2):
+            return None
+        
+        try:
+            last_candle = ind_5m.iloc[-1]
+            prev_candle = ind_5m.iloc[-2]
+
+            # (Oversold Signal)
+            rsi = Decimal(str(last_candle['RSI_14']))
+            prev_rsi = Decimal(str(prev_candle['RSI_14']))
             
+            is_oversold_exit = (prev_rsi < 30) and (rsi > 30)
+            if not is_oversold_exit: return None
+
+            # (Volume Breakout)
+            norm_vol = Decimal(str(last_candle['norm_volume']))
+            avg_norm_vol = Decimal(str(last_candle[f'NORM_VOL_SMA_{self.vol_sma_len}']))
+            
+            if norm_vol <= (avg_norm_vol * Decimal('1.5')):
+                # self.log(f"    -> ОТКЛОНЕНО (RSI 5M): Низкий Norm. Volume ({norm_vol:.2f} <= {avg_norm_vol*Decimal('1.5'):.2f})")
+                return None
+            
+            # (Stochastic Filter)
+            stoch_k = Decimal(str(last_candle['STOCHRSIk_14_14_3_3']))
+            prev_stoch_k = Decimal(str(prev_candle['STOCHRSIk_14_14_3_3']))
+            
+            is_stoch_exit = (prev_stoch_k < 20) and (stoch_k > 20)
+            if not is_stoch_exit:
+                # self.log("    -> ОТКЛОНЕНО (RSI 5M): StochRSI не выходит из зоны < 20.")
+                return None
+
+            # (Micro-trend Filter)
+            ema_10 = Decimal(str(last_candle[f'EMA_{self.ema_scalp_slow_len}']))
+            if current_price < ema_10:
+                # self.log("    -> ОТКЛОНЕНО (RSI 5M): Цена ниже EMA 10 (микро-даунтренд).")
+                return None
+                
+            atr_14 = Decimal(str(last_candle[f'ATRr_{self.atr_period}']))
+
+        except (ValueError, KeyError, IndexError):
+            return None
+
+        entry_price = current_price
+        
+        # (SL: Entry - (ATR * 1.0))
+        sl_mult = Decimal('1.0')
+        stop_loss_price = self._round_price(entry_price - (atr_14 * sl_mult))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # (TP: R/R 1.5)
+        rr_mult = Decimal('1.5')
+        reward_per_coin = risk_per_coin * rr_mult
+        target_tp = self._round_price(entry_price + reward_per_coin)
         rr_ratio = reward_per_coin / risk_per_coin
         
-        max_rr_cap = Decimal('3.0') 
-        if rr_ratio > max_rr_cap:
-            self.log(f"    -> (Momentum) R/R ({rr_ratio:.2f}) превышает лимит {max_rr_cap}. Цель скорректирована.")
-            rr_ratio = max_rr_cap
-            reward_per_coin = risk_per_coin * rr_ratio
-            target_tp = self._round_price(entry_price + reward_per_coin)
+        if rr_ratio < Decimal('1.5'): return None # (Требование R/R >= 1.5)
+
+        self.log(f"    -> Кандидат (SCALP_RSI_VOLUME_5M): LONG на 5M (RSI oversold + volume breakout). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {"type": "SCALP_RSI_VOLUME_5M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
+
+
+    def _find_entry_scalp_breakout_1m(self, market_data, current_price):
+        ind_1m = market_data.get('indicators_1m')
+        if ind_1m is None or len(ind_1m) < (self.vol_sma_len + 2):
+            return None
+            
+        try:
+            last_candle = ind_1m.iloc[-1]
+            
+            # (Breakout Level)
+            resistance = Decimal(str(ind_1m.iloc[-11:-1]['high'].max())) # Max high за 10 предыдущих свечей
+            current_close = Decimal(str(last_candle['close']))
+            
+            if current_close <= resistance:
+                return None
+                
+            # (MACD Filter)
+            macd_hist = Decimal(str(last_candle['MACDh_12_26_9']))
+            prev_macd_hist = Decimal(str(ind_1m.iloc[-2]['MACDh_12_26_9']))
+            
+            if not (macd_hist > 0 and macd_hist > prev_macd_hist):
+                # self.log("    -> ОТКЛОНЕНО (BREAKOUT 1M): MACD фильтр не пройден (Hist <= 0 или падает).")
+                return None
+                
+            # (Volume Confirmation)
+            norm_vol = Decimal(str(last_candle['norm_volume']))
+            avg_norm_vol = Decimal(str(last_candle[f'NORM_VOL_SMA_{self.vol_sma_len}']))
+            
+            if norm_vol <= (avg_norm_vol * Decimal('1.2')):
+                # self.log(f"    -> ОТКЛОНЕНО (BREAKOUT 1M): Низкий Norm. Volume ({norm_vol:.2f} <= {avg_norm_vol*Decimal('1.2'):.2f})")
+                return None
+            
+            # (Overbought Filter)
+            rsi = Decimal(str(last_candle['RSI_14']))
+            if rsi >= 70:
+                # self.log("    -> ОТКЛОНЕНО (BREAKOUT 1M): RSI >= 70 (перекупленность).")
+                return None
+                
+            # (Volatility Filter)
+            atr_14 = Decimal(str(last_candle[f'ATRr_{self.atr_period}']))
+            avg_atr_14 = Decimal(str(ind_1m.iloc[-11:-1][f'ATRr_{self.atr_period}'].mean()))
+            if atr_14 <= avg_atr_14:
+                # self.log("    -> ОТКЛОНЕНО (BREAKOUT 1M): Низкая волатильность (ATR <= Avg ATR).")
+                return None
+
+        except (ValueError, KeyError, IndexError):
+            return None
+
+        entry_price = current_price
         
-        self.log(f"    -> Кандидат (Momentum Pullback): StochRSI откат (ADX>35, RSI>50). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
-        return {"type": "MOMENTUM_1H", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
-    
-    # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-    def _is_bullish_pin_bar(self, c):
-        c_open, c_close, c_high, c_low = Decimal(str(c['open'])), Decimal(str(c['close'])), Decimal(str(c['high'])), Decimal(str(c['low']))
-        body, rng = abs(c_close - c_open), c_high - c_low
-        if body == 0 or rng == 0: return False
-        return (min(c_open, c_close) - c_low) > body * 2 and body < rng * Decimal('0.33')
+        # (SL: Entry - (ATR * 0.5))
+        sl_mult = Decimal('0.5')
+        stop_loss_price = self._round_price(entry_price - (atr_14 * sl_mult))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # (TP: R/R 1.0)
+        rr_mult = Decimal('1.0')
+        reward_per_coin = risk_per_coin * rr_mult
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = reward_per_coin / risk_per_coin
+        
+        if rr_ratio < Decimal('1.0'): return None # (Требование R/R >= 1.0)
 
-    def _is_bullish_hammer(self, c):
-       c_open, c_close, c_high, c_low = Decimal(str(c['open'])), Decimal(str(c['close'])), Decimal(str(c['high'])), Decimal(str(c['low']))
-       body, rng = abs(c_close - c_open), c_high - c_low
-       if body == 0 or rng == 0: return False
-       lower_shadow = min(c_open, c_close) - c_low
-       upper_shadow = c_high - max(c_open, c_close)
-       return (lower_shadow > body * Decimal('2')) and (upper_shadow < body) and (c_close > c_open) and (body < rng * Decimal('0.33'))
-
-    def _is_bullish_engulfing(self, prev_c, c):
-        prev_open, prev_close = Decimal(str(prev_c['open'])), Decimal(str(prev_c['close']))
-        c_open, c_close = Decimal(str(c['open'])), Decimal(str(c['close']))
-        return (c_close > prev_open) and (c_open < prev_close) and (c_close > c_open) and (prev_close < prev_open)
-
-    def _get_next_resistance(self, key_levels, entry_price):
-        if not key_levels['resistances']: return None
-        for res in key_levels['resistances']:
-            if res > entry_price:
-                return self._round_price(res)
-        return None
+        self.log(f"    -> Кандидат (SCALP_BREAKOUT_CONFIRM_1M): LONG на 1M (breakout + MACD + volume). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {"type": "SCALP_BREAKOUT_CONFIRM_1M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     # ---
-    # --- ЛОГИКА ОТКРЫТИЯ ПОЗИЦИИ (Без изменений) ---
+    # --- ЛОГИКА ОТКРЫТИЯ ПОЗИЦИИ (Изменена v1.0 Scalp) ---
     # ---
     def _calculate_and_open_position(self, best_signal, market_data):
         entry_price = best_signal['entry_price']
@@ -732,24 +562,24 @@ class TradingBot(threading.Thread):
         self.current_trade_strategy_type = best_signal['type']
         risk_per_coin = entry_price - stop_loss_price
         
-        if self.current_trade_strategy_type in ['MEAN_REVERSION', 'MOMENTUM_1H', 'BREAKOUT_4H']:
-            self.take_profit_price_1 = self.final_take_profit_price 
-            self.log(f"     -> Расчет для {self.current_trade_strategy_type}. R/R: {rr_ratio:.1f}:1 (Только Финал ТП)")
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): TP1 = 50% до Final TP ***
+        reward_per_coin = self.final_take_profit_price - entry_price
+        if reward_per_coin > 0:
+             self.take_profit_price_1 = self._round_price(entry_price + (reward_per_coin * Decimal('0.5')))
         else:
-            self.take_profit_price_1 = self._round_price(entry_price + (risk_per_coin * Decimal('1.0')))
-            self.log(f"     -> Расчет для {self.current_trade_strategy_type}. R/R: {rr_ratio:.1f}:1")
+             self.take_profit_price_1 = self.final_take_profit_price
+        
+        self.log(f"     -> Расчет для {self.current_trade_strategy_type}. R/R: {rr_ratio:.1f}:1")
+        # ---
 
         usdt_balance = market_data['usdt_balance']
-        try:
-            ind_4h = market_data.get('indicators_4h')
-            current_atr_perc = (Decimal(str(ind_4h.iloc[-1]['ATRr_14'])) / entry_price) * 100
-        except (IndexError, ValueError):
-            self.log("Пропуск открытия: Недопустимые данные 4H ATR."); return
-            
+        
+        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Риск 0.5x для всех скальп-стратегий ***
         risk_per_trade = self.base_risk_per_trade
-        if current_atr_perc > 3:
+        if self.current_trade_strategy_type in ["SCALP_LIQUIDITY_SWEEP_3M", "SCALP_RSI_VOLUME_5M", "SCALP_BREAKOUT_CONFIRM_1M"]:
             risk_per_trade = self.base_risk_per_trade * Decimal('0.5')
-            self.log(f"     -> Высокая волатильность (>3% ATR), риск уменьшен до {risk_per_trade * 100:.2f}%")
+            self.log(f"     -> Scalping-стратегия, риск уменьшен до {risk_per_trade * 100:.2f}%")
+        # ---
         
         risk_capital = usdt_balance * risk_per_trade
         if risk_per_coin <= 0: 
@@ -802,10 +632,8 @@ class TradingBot(threading.Thread):
             self.log(f"    - ID СДЕЛКИ: {self.current_trade_id}, Тип: {self.current_trade_strategy_type}")
             self.log(f"    - СТОП-ЛОСС: ${self.stop_loss_price:.{self.price_precision}f} (Риск: ${final_risk_amount:.2f})")
             
-            if self.current_trade_strategy_type in ['MEAN_REVERSION', 'MOMENTUM_1H', 'BREAKOUT_4H']:
-                 self.log(f"    - TP (Финал): ${self.final_take_profit_price:.{self.price_precision}f} (RR: {rr_ratio:.1f}:1)")
-            else:
-                 self.log(f"    - TP1 (50%): ${self.take_profit_price_1:.{self.price_precision}f}, Финальный TP: ${self.final_take_profit_price:.{self.price_precision}f} (RR: {rr_ratio:.1f}:1)")
+            # (Все скальп-стратегии используют TP1 + Final TP)
+            self.log(f"    - TP1 (50%): ${self.take_profit_price_1:.{self.price_precision}f}, Финальный TP: ${self.final_take_profit_price:.{self.price_precision}f} (RR: {rr_ratio:.1f}:1)")
 
         except BinanceAPIException as e:
             if e.code == -2010: self.log(f"ОШИБКА ОТКРЫТИЯ: Недостаточно средств на балансе. {e.message}")
@@ -815,7 +643,7 @@ class TradingBot(threading.Thread):
             self.log(f"КРИТИЧЕСКАЯ ОШИБКА при открытии позиции: {e}"); self._reset_position_state()
 
     # ---
-    # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (v9.9 - Добавлен выход по ADX для Momentum) ---
+    # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (v1.0 Scalp - Добавлен Timeout) ---
     # ---
     def _check_and_manage_exit_conditions(self, market_data, current_price, current_high, current_low, current_1m_candle):
         if not self.position_side: return
@@ -826,43 +654,40 @@ class TradingBot(threading.Thread):
         # 1. Проверка СТОП-ЛОССА
         if current_low <= self.stop_loss_price:
             self.sl_confirmation_counter += 1
-            self.log(f"⚠️ ПРЕДУПРЕЖДЕНИЕ SL: Цена ({current_low:.{self.price_precision}f}) <= Стоп-лосс ({self.stop_loss_price:.{self.price_precision}f}). Подтверждение {self.sl_confirmation_counter}/3...")
+            # (Для скальпинга v1.0, 1 минута = 1 подтверждение. 2 мин = выход)
+            sl_confirm_needed = 2 
+            self.log(f"⚠️ ПРЕДУПРЕЖДЕНИЕ SL: Цена ({current_low:.{self.price_precision}f}) <= Стоп-лосс ({self.stop_loss_price:.{self.price_precision}f}). Подтверждение {self.sl_confirmation_counter}/{sl_confirm_needed}...")
             self._save_state()
-            if self.sl_confirmation_counter >= 3:
+            if self.sl_confirmation_counter >= sl_confirm_needed:
                 reason = "TRAIL STOP" if self.is_trailing_active else "STOP LOSS"
-                self.log(f"✅ ВЫХОД: {reason} ПОДТВЕРЖДЕН (3 мин). Минимальная цена 1М свечи (${current_low:.{self.price_precision}f}) достигла/пробила стоп-уровень (${self.stop_loss_price:.{self.price_precision}f}).")
+                self.log(f"✅ ВЫХОД: {reason} ПОДТВЕРЖДЕН ({sl_confirm_needed} мин). Минимальная цена 1М свечи (${current_low:.{self.price_precision}f}) достигла/пробила стоп-уровень (${self.stop_loss_price:.{self.price_precision}f}).")
                 exec_price = min(current_open, self.stop_loss_price)
                 self.log(f"    -> Цена исполнения (SL): ${exec_price:.{self.price_precision}f}")
-                self._close_position(reason=f"{reason} (3-min confirm)", is_partial=False, execution_price=exec_price)
+                self._close_position(reason=f"{reason} ({sl_confirm_needed}-min confirm)", is_partial=False, execution_price=exec_price)
                 return
         else:
             if self.sl_confirmation_counter > 0:
                 self.log(f"ИНФО: Условие SL больше не выполняется. Cброс счетчика подтверждения ({self.sl_confirmation_counter} -> 0).")
                 self.sl_confirmation_counter = 0; self._save_state()
         
-        # (v9.9): Выход по угасанию Momentum (ADX < 25)
-        if self.current_trade_strategy_type == "MOMENTUM_1H":
-            try:
-                ind_1h = market_data.get('indicators_1h')
-                if ind_1h is not None and not ind_1h.empty:
-                    adx_1h = Decimal(str(ind_1h.iloc[-1][f'ADX_{self.adx_len}']))
-                    if adx_1h < 25:
-                        self.log(f"ВЫХОД (Momentum): 1H ADX ({adx_1h:.1f}) упал < 25. Импульс иссяк.")
-                        self._close_position(reason="MOMENTUM EXIT (ADX<25)", is_partial=False, execution_price=current_open)
-                        return
-            except (ValueError, KeyError, IndexError):
-                pass # Игнорируем ошибку индикатора, пусть SL/TP отработают
+        # (Удален выход по ADX для Momentum)
         
-        # 2. Управление по Времени
-        if self.entry_time and not self.is_tp1_hit:
-            trade_duration = (self._get_current_time() - self.entry_time).total_seconds() / 86400
-            max_duration_days = 5
-            if trade_duration >= max_duration_days and current_price > self.entry_price:
-                self.log(f"!!! УПРАВЛЕНИЕ ПО ВРЕМЕНИ: Сделка в плюсе >{max_duration_days} дней. Активация режима TP1.")
-                self._close_position(reason=f"TIME Mgmt ({max_duration_days}d)", is_partial=True, partial_ratio=0.5, execution_price=current_open)
-                self.is_tp1_hit = True; self.stop_loss_price = self.entry_price; self.is_trailing_active = True
-                self.log(f"УПРАВЛЕНИЕ: Позиция обезопасена. Стоп в безубытке, ТРЕЙЛИНГ ПО ATR АКТИВИРОВАН.")
-                self._save_state(); return
+        # 2. Управление по Времени (SCALP TIMEOUT)
+        if self.entry_time:
+            trade_duration_minutes = (self._get_current_time() - self.entry_time).total_seconds() / 60
+            max_duration_minutes = None
+            
+            if self.current_trade_strategy_type == "SCALP_BREAKOUT_CONFIRM_1M": 
+                max_duration_minutes = 5 # (3-5 мин)
+            elif self.current_trade_strategy_type == "SCALP_LIQUIDITY_SWEEP_3M": 
+                max_duration_minutes = 12 # (9-12 мин)
+            elif self.current_trade_strategy_type == "SCALP_RSI_VOLUME_5M": 
+                max_duration_minutes = 20 # (15-20 мин)
+
+            if max_duration_minutes and trade_duration_minutes >= max_duration_minutes:
+                self.log(f"!!! УПРАВЛЕНИЕ ПО ВРЕМЕНИ (TIMEOUT): Сделка {self.current_trade_strategy_type} >{max_duration_minutes} мин. Принудительное закрытие.")
+                self._close_position(reason=f"TIMEOUT ({max_duration_minutes}m)", is_partial=False, execution_price=current_open)
+                return
         
         # 3. Проверка ТЕЙК-ПРОФИТОВ
         if not self.is_tp1_hit and current_high >= self.final_take_profit_price:
@@ -878,32 +703,37 @@ class TradingBot(threading.Thread):
             self._close_position(reason="FINAL TP", is_partial=False, execution_price=exec_price); return
         
         if not self.is_tp1_hit and current_high >= self.take_profit_price_1:
-            if self.current_trade_strategy_type in ['MEAN_REVERSION', 'MOMENTUM_1H', 'BREAKOUT_4H']: return 
+            # (Все скальп-стратегии используют TP1)
             self.log(f"ФИКСАЦИЯ: Сработал Тейк-Профит 1 по цене ${self.take_profit_price_1:.{self.price_precision}f} (High: {current_high})")
             exec_price = max(current_open, self.take_profit_price_1)
             self.log(f"    -> Цена исполнения (TP1): ${exec_price:.{self.price_precision}f}")
             self._close_position(reason="TP1", is_partial=True, partial_ratio=0.5, execution_price=exec_price)
-            self.is_tp1_hit = True; self.stop_loss_price = self.entry_price; self.is_trailing_active = True
+            self.is_tp1_hit = True; 
+            
+            # (Трейлинг для скальпинга: SL в БУ + активация ATR)
+            self.stop_loss_price = self.entry_price; 
+            self.is_trailing_active = True
+            
             self.log(f"УПРАВЛЕНИЕ: Позиция обезопасена. Стоп в безубытке, ТРЕЙЛИНГ ПО ATR АКТИВИРОВАН.")
             self._save_state(); return
         
         # 4. Логика Трейлинг-Стопа
         if self.is_trailing_active:
-            profit_lock_target = self.entry_price + (self.entry_price - self.initial_stop_loss_price) * 2
-            if not self.is_profit_locked and current_high >= profit_lock_target:
-                new_stop_price = self.entry_price + (self.entry_price - self.initial_stop_loss_price)
-                if new_stop_price > self.stop_loss_price:
-                    self.stop_loss_price = self._round_price(new_stop_price)
-                    self.is_profit_locked = True; self._save_state()
-                    self.log(f"УПРАВЛЕНИЕ: ЗАМОК НА ПРИБЫЛЬ. Цена достигла 2R. Стоп-лосс поднят до 1R: ${self.stop_loss_price:.{self.price_precision}f}")
+            # (Для скальпинга нет 'profit lock' на 2R, только ATR трейлинг)
             
-            ind_4h = market_data.get('indicators_4h')
-            if ind_4h is not None and not ind_4h.empty:
-                atr_4h = Decimal(str(ind_4h.iloc[-1][f'ATRr_{self.atr_period}']))
-                new_sl = self._round_price(current_price - (atr_4h * self.atr_multiplier_trail)) 
-                if new_sl > self.stop_loss_price:
-                    self.stop_loss_price = new_sl; self._save_state()
-                    self.log(f"УПРАВЛЕНИЕ: Трейлинг-стоп подтянут по ATR до ${self.stop_loss_price:.{self.price_precision}f}")
+            # (Используем 15M ATR для более стабильного трейлинга)
+            ind_15m = market_data.get('indicators_15m')
+            if ind_15m is not None and not ind_15m.empty:
+                try:
+                    atr_15m = Decimal(str(ind_15m.iloc[-1][f'ATRr_{self.atr_period}']))
+                    # (Для скальпинга используем более агрессивный трейлинг, 1.5 * ATR)
+                    trail_mult = Decimal('1.5') 
+                    new_sl = self._round_price(current_price - (atr_15m * trail_mult)) 
+                    if new_sl > self.stop_loss_price:
+                        self.stop_loss_price = new_sl; self._save_state()
+                        self.log(f"УПРАВЛЕНИЕ: Трейлинг-стоп (15m ATR) подтянут до ${self.stop_loss_price:.{self.price_precision}f}")
+                except (ValueError, KeyError):
+                    pass # Ошибка ATR
         
         if not self.is_backtest:
             log_type = "ТРЕЙЛИНГ" if self.is_trailing_active else "УПРАВЛЕНИЕ"
@@ -1028,7 +858,7 @@ class TradingBot(threading.Thread):
         try:
             info = self.binance_client.get_symbol_info(self.symbol)
             self.base_asset, self.quote_asset = info['baseAsset'], info['quoteAsset']
-            if self.is_backtest: self.binance_client.base_asset, self.binance_client.quote_asset = self.base_asset, self.quote_asset
+            if self.is_backtest: self.binance_client.base_asset, self.binance_client.quote_asset = self.base_asset, self.base_asset
             for f in info['filters']:
                 if f['filterType'] == 'LOT_SIZE': self.step_size, self.qty_precision = Decimal(f['stepSize']), abs(Decimal(f['stepSize']).as_tuple().exponent)
                 if f['filterType'] == 'PRICE_FILTER': self.price_precision = abs(Decimal(f['tickSize']).as_tuple().exponent)
@@ -1040,16 +870,30 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"Не удалось получить правила торгов для {self.symbol}. Ошибка: {e}"); return False
 
     def _get_market_data(self):
-        # (v9.1 - Без BTC)
+        # (v1.0 Scalp: 1m, 3m, 5m, 15m, 1d)
         try:
-            kline_calls = { Client.KLINE_INTERVAL_1HOUR: 205, Client.KLINE_INTERVAL_4HOUR: 205, Client.KLINE_INTERVAL_1DAY: 250 }
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            # (Добавляем недостающие константы, если они не импортированы)
+            if not hasattr(Client, 'KLINE_INTERVAL_3MINUTE'): Client.KLINE_INTERVAL_3MINUTE = '3m'
+            if not hasattr(Client, 'KLINE_INTERVAL_5MINUTE'): Client.KLINE_INTERVAL_5MINUTE = '5m'
+            if not hasattr(Client, 'KLINE_INTERVAL_15MINUTE'): Client.KLINE_INTERVAL_15MINUTE = '15m'
+                
+            kline_calls = {
+                Client.KLINE_INTERVAL_1MINUTE: 300,
+                Client.KLINE_INTERVAL_3MINUTE: 200,
+                Client.KLINE_INTERVAL_5MINUTE: 150,
+                Client.KLINE_INTERVAL_15MINUTE: 205,
+                Client.KLINE_INTERVAL_1DAY: 250
+            }
+            
+            with ThreadPoolExecutor(max_workers=6) as executor:
                 future_map = {}
                 for interval, limit in kline_calls.items(): 
                     future_map[executor.submit(self.binance_client.get_klines, symbol=self.symbol, interval=interval, limit=limit)] = {'type': 'klines', 'interval': interval}
+                
                 future_map[executor.submit(self.binance_client.get_asset_balance, asset=self.quote_asset)] = {'type': 'usdt_balance'}
                 future_map[executor.submit(self.binance_client.get_asset_balance, asset=self.base_asset)] = {'type': 'base_balance'}
                 future_map[executor.submit(self.binance_client.get_symbol_ticker, symbol=self.symbol)] = {'type': 'ticker'}
+                
                 results, klines_results = {}, {}
                 for future in as_completed(future_map):
                     task_info, task_type = future_map[future], future_map[future]['type']
@@ -1057,10 +901,13 @@ class TradingBot(threading.Thread):
                         result_data = future.result()
                         if task_type == 'klines': klines_results[task_info['interval']] = result_data
                         else: results[task_type] = result_data
-                    except Exception as e: self.log(f"Ошибка в подзадаче {task_type}: {e}"); return None
+                    except Exception as e: self.log(f"Ошибка в подзадаче {task_type} ({task_info.get('interval', 'N/A')}): {e}"); return None
+            
             return {
-                "indicators_1h": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1HOUR)),
-                "indicators_4h": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_4HOUR)), 
+                "indicators_1m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1MINUTE)),
+                "indicators_3m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_3MINUTE)),
+                "indicators_5m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_5MINUTE)),
+                "indicators_15m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_15MINUTE)),
                 "indicators_1d": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1DAY)),
                 "usdt_balance": Decimal(results.get("usdt_balance", {}).get('free', '0')), 
                 "base_balance": Decimal(results.get("base_balance", {}).get('free', '0')),
@@ -1068,29 +915,33 @@ class TradingBot(threading.Thread):
             }
         except Exception as e: self.log(f"Ошибка получения данных: {e}"); return None
 
-    def _calculate_indicators(self, klines):
-        # (ИЗМЕНЕНО v9.10: Добавлен MACD, Нормализованный Объем)
+    def _calculate_indicators(self, klines, interval='N/A'):
+        # (ИЗМЕНЕНО v1.0 Scalp: Добавлены EMA 5, 10. Удалены EMA 9, 21, 50, BB, KC)
         if not klines or len(klines) < 50: return pd.DataFrame()
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'trades', 'tbav', 'tqav', 'ig'])
         for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col])
-        df.ta.ema(length=self.ema_superfast_len, append=True); df.ta.ema(length=self.ema_fast_len, append=True); df.ta.ema(length=self.ema_slow_len, append=True); df.ta.ema(length=self.ema_trend_len, append=True)
+        
+        # (Новые EMA для скальпинга)
+        df.ta.ema(length=self.ema_scalp_fast_len, append=True) # 5
+        df.ta.ema(length=self.ema_scalp_slow_len, append=True) # 10
+        df.ta.ema(length=self.ema_trend_len, append=True)      # 200
+        
         df.ta.rsi(length=14, append=True); df.ta.atr(length=self.atr_period, append=True); df.ta.stochrsi(append=True)
         df.ta.adx(length=self.adx_len, append=True)
-        df.ta.bbands(length=self.bb_len, std=self.bb_std, append=True); df.ta.kc(length=self.kc_len, scalar=self.kc_scalar, append=True)
+        
+        # (Удалены BBANDS и KC)
         
         df[f'VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['volume'], length=self.vol_sma_len)
         
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10): Нормализованный объем (по предложению 2025) ***
+        # (Нормализованный объем)
         atr_col = f'ATRr_{self.atr_period}'
-        # Заполняем NaN и 0, чтобы избежать ошибок деления
         safe_atr = df[atr_col].replace(0, np.nan).fillna(method='ffill').fillna(1) 
-        safe_atr[safe_atr == 0] = 1 # Убедимся, что 0 нет
+        safe_atr[safe_atr == 0] = 1 
         df['norm_volume'] = df['volume'] / safe_atr
         df[f'NORM_VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['norm_volume'], length=self.vol_sma_len)
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
         
-        # (v9.9 Filters)
-        df.ta.macd(append=True) # Расчет MACD
+        # (MACD)
+        df.ta.macd(append=True) 
         
         return df
     
@@ -1107,6 +958,7 @@ class TradingBot(threading.Thread):
             if self.stop_event.is_set(): break
             remaining_time = end_time - time.time()
             time.sleep(min(sleep_interval, remaining_time))
+            
     def _wait_or_continue(self, seconds=None):
         # (Эта функция без изменений)
         if self.is_backtest: self.binance_client._advance_tick(); return
@@ -1118,6 +970,7 @@ class TradingBot(threading.Thread):
                 if seconds_to_sleep < 0 or seconds_to_sleep > 65: self.log(f"ПРЕДУПРЕЖДЕНИЕ: Ошибка расчета синхронизации (расчет: {seconds_to_sleep}с). Сплю 60с."); seconds_to_sleep = 60.0
                 self._sleep_interruptible(seconds_to_sleep)
             except Exception as e: self.log(f"Ошибка синхронизации времени: {e}. Сплю 60 секунд (fallback)."); self._sleep_interruptible(60)
+            
     def _round_price(self, price): return price.quantize(Decimal('1e-' + str(self.price_precision)))
     def _round_quantity(self, qty): return (qty // self.step_size) * self.step_size
     def _convert_commission_to_usdt(self, commission, asset):
@@ -1142,17 +995,17 @@ class TradingBot(threading.Thread):
         self.event_queue.put({'type': 'log', 'data': detailed_message})
 
     def _update_dashboard_data(self, market_data, current_price):
-        # (Эта функция без изменений)
+        # (Изменено v1.0 Scalp: Удалены индикаторы 4H)
         pv = market_data['usdt_balance'] + (market_data['base_balance'] * current_price); wr = (self.win_trades/(self.win_trades+self.loss_trades)*100) if (self.win_trades+self.loss_trades)>0 else 0
         unrealized_pnl = "N/A"
         if self.position_side == 'LONG': pnl = (current_price - self.entry_price) * self.quantity; unrealized_pnl = f"{pnl:+.2f}"
         data = {'usdt_balance':f"{market_data['usdt_balance']:.2f}", 'base_balance':f"{market_data['base_balance']:.{self.qty_precision}f}", 'portfolio_value':f"{pv:.2f}", 'unrealized_pnl': unrealized_pnl, 'total_pnl':f"{self.total_pnl_usdt:.2f}", 'total_fees':f"{self.total_fees_paid_usdt:.4f}", 'win_rate':f"{wr:.1f}% ({self.win_trades}/{self.loss_trades})"}
-        ind_4h = market_data.get('indicators_4h')
-        if ind_4h is not None and not ind_4h.empty:
-            last_4h = ind_4h.iloc[-1]
-            data['ema_9_4h'] = f"{Decimal(str(last_4h[f'EMA_{self.ema_superfast_len}'])):.2f}"; data['ema_21_4h'] = f"{Decimal(str(last_4h[f'EMA_{self.ema_fast_len}'])):.2f}"; data['ema_50_4h'] = f"{Decimal(str(last_4h[f'EMA_{self.ema_slow_len}'])):.2f}"
-            data['ema_200_4h'] = f"{Decimal(str(last_4h[f'EMA_{self.ema_trend_len}'])):.2f}"; data['rsi_14_4h'] = f"{Decimal(str(last_4h['RSI_14'])):.2f}"; data['atr_14_4h'] = f"{Decimal(str(last_4h[f'ATRr_{self.atr_period}'])):.2f}"
+        
+        # (Блок индикаторов 4H удален, т.к. market_data['indicators_4h'] больше не существует)
+        
         self.event_queue.put({'type': 'dashboard_update', 'data': data})
+        
+        # (Обновление статистики по новым стратегиям)
         stats_data = {}
         for stype in self.strategy_types:
             if stype == "UNKNOWN": continue
@@ -1178,7 +1031,7 @@ class TradingBot(threading.Thread):
             return datetime.fromtimestamp(self.binance_client.get_server_time()['serverTime'] / 1000, tz=UTC)
     
     def _finalize_run(self):
-        # (Эта функция без изменений)
+        # (Эта функция без изменений, self.strategy_types обновлен)
         self._save_state()
         if not self.stop_event.is_set():
             self.log("\n" + "="*50)
