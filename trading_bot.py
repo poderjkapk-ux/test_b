@@ -32,7 +32,7 @@ except ImportError:
 STATE_FILE = "bot_state_multi_strategy.json"
 
 
-# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v9.7 Smart-SL) ---
+# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v9.10 2025 Filters) ---
 class TradingBot(threading.Thread):
     
     def __init__(self, api_key, api_secret, event_queue, risk_per_trade, rr_ratio, symbol, active_strategies_config, backtest_client=None):
@@ -41,11 +41,12 @@ class TradingBot(threading.Thread):
         self.api_key, self.api_secret, self.event_queue = api_key, api_secret, event_queue
         try:
             self.base_risk_per_trade = Decimal(str(risk_per_trade)) / 100
-            self.base_rr_ratio = Decimal(str(rr_ratio)) 
+            # *** ИЗМЕНЕНИЕ (v9.9): Минимальный RR повышен до 2.0 по рекомендации 2025 ***
+            self.base_rr_ratio = Decimal('2.0') # (Было 1.3)
         except (ValueError, TypeError):
             self.log("Ошибка: риск и R/R должны быть числами. Используются значения по умолчанию.")
             self.base_risk_per_trade = Decimal('0.01')
-            self.base_rr_ratio = Decimal('1.3')
+            self.base_rr_ratio = Decimal('2.0')
 
         self.symbol = symbol.upper()
         self.stop_event = threading.Event()
@@ -101,7 +102,8 @@ class TradingBot(threading.Thread):
         # --- Параметры индикаторов ---
         self.ema_superfast_len, self.ema_fast_len, self.ema_slow_len, self.ema_trend_len = 9, 21, 50, 200
         self.atr_period = 14 
-        self.atr_multiplier_sl = Decimal('1.5') # Множитель для Mean Reversion
+        # *** ИЗМЕНЕНИЕ (v9.9): Множитель SL для Mean Reversion увеличен до 2.0 (по предложению) ***
+        self.atr_multiplier_sl = Decimal('2.0') # Множитель для Mean Reversion (Был 1.5 в v9.7)
         self.atr_multiplier_trail = Decimal('2.0')
         self.bb_len, self.bb_std = 20, 2.0
         self.kc_len, self.kc_scalar = 20, 2.0
@@ -181,7 +183,8 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"ОШИБКА: Не удалось загрузить состояние бота: {e}")
 
     def run(self):
-        bot_name = "Multi-Strategy Trader v9.7 (Smart-SL)"
+        # *** ИЗМЕНЕНИЕ (v9.10): Обновлена версия ***
+        bot_name = "Multi-Strategy Trader v9.10 (2025 Filters)"
         mode = "БЭКТЕСТ (1M)" if self.is_backtest else "РЕАЛЬНАЯ ТОРГОВЛЯ" 
         self.log(f"Запуск бота '{bot_name}' в режиме '{mode}' для символа {self.symbol}...")
         
@@ -234,7 +237,7 @@ class TradingBot(threading.Thread):
                     if best_signal:
                         self._calculate_and_open_position(best_signal, market_data)
                     elif should_check_logic: 
-                        self.log("Анализ завершен: Нет сигналов, соответствующих Tier-системе.")
+                        self.log("Анализ завершен: Нет сигналов, соответствующих Tier-системе (или R/R < 2.0).")
                     
                 current_time_seconds = time.time()
                 if not self.is_backtest and current_time_seconds - self.last_heartbeat_log_time > 300: 
@@ -275,7 +278,7 @@ class TradingBot(threading.Thread):
             self.log(f"Ошибка в логе Heartbeat: {e}")
 
     # ---
-    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v9.2 Tiered-Priority) ---
+    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v9.9 - R:R >= 2.0) ---
     # ---
     def _get_algorithmic_decision(self, market_data, current_price):
         
@@ -315,6 +318,7 @@ class TradingBot(threading.Thread):
             signals["MOMENTUM_1H"] = self._find_entry_momentum_pullback_1h(market_data, current_price, key_levels, is_1d_bull_trend)
         
         # --- УРОВЕНЬ 1: Сигналы Разворота (Высший приоритет) ---
+        # *** ИЗМЕНЕНИЕ (v9.9): Проверка R/R >= self.base_rr_ratio (который теперь 2.0) ***
         tier_1_signals = [signals["RSI_DIVERGENCE"], signals["MEAN_REVERSION"]]
         valid_tier_1 = [s for s in tier_1_signals if s and s.get('rr_ratio', Decimal('0')) >= self.base_rr_ratio]
         
@@ -354,22 +358,25 @@ class TradingBot(threading.Thread):
         return levels
 
     # ---
-    # --- СТРАТЕГИИ (v9.2 - MOMENTUM_1H упрощен) ---
+    # --- СТРАТЕГИИ (v9.10 - 2025 Filters) ---
     # ---
 
     def _find_entry_ema_pullback_4h(self, market_data, current_price, key_levels, is_1d_bull_trend):
-        # (ИЗМЕНЕНО v9.7: Smart SL)
+        # (ИЗМЕНЕНО v9.10: Используем Vol/ATR)
         if not is_1d_bull_trend:
             return None
         ind_4h = market_data.get('indicators_4h')
         ind_1h = market_data.get('indicators_1h')
-        if ind_4h is None or ind_1h is None or len(ind_4h) < self.ema_slow_len or len(ind_1h) < 2: return None
+        if ind_4h is None or ind_1h is None or len(ind_4h) < self.ema_slow_len or len(ind_1h) < (self.vol_sma_len + 1): return None
         last_4h = ind_4h.iloc[-1]
         try:
             ema9_4h = Decimal(str(last_4h[f'EMA_{self.ema_superfast_len}']))
             ema21_4h = Decimal(str(last_4h[f'EMA_{self.ema_fast_len}']))
             ema50_4h = Decimal(str(last_4h[f'EMA_{self.ema_slow_len}']))
             atr_4h = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
+            adx_4h = Decimal(str(last_4h[f'ADX_{self.adx_len}']))
+            if adx_4h < 25: 
+                self.log("    -> ОТКЛОНЕНО (EMA Cross): ADX < 25, тренд 4H слишком слабый."); return None
         except (ValueError, KeyError): return None
         if not (ema9_4h > ema21_4h and ema21_4h > ema50_4h): return None
         is_in_zone = (ema50_4h * Decimal('0.998')) < current_price < (ema9_4h * Decimal('1.002'))
@@ -377,11 +384,25 @@ class TradingBot(threading.Thread):
         signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
         is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
         if not (is_hammer or is_engulfing): return None
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: Vol/ATR) ***
+        try:
+            # Используем нормализованный объем (по предложению 2025)
+            signal_norm_vol_1h = Decimal(str(signal_1h['norm_volume']))
+            avg_norm_vol_1h = Decimal(str(prev_1h[f'NORM_VOL_SMA_{self.vol_sma_len}'])) # Среднее с *предыдущей* свечи
+            
+            rsi_1h = Decimal(str(signal_1h['RSI_14']))
+            if signal_norm_vol_1h <= avg_norm_vol_1h: 
+                self.log("    -> ОТКЛОНЕНО (EMA Cross): Низкий нормализованный объем (Vol/ATR) на 1H PA свече."); return None
+            if rsi_1h < 50:
+                self.log("    -> ОТКЛОНЕНО (EMA Cross): RSI < 50 на 1H PA свече."); return None
+        except (ValueError, KeyError): return None
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+
         entry_price = current_price
         
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.7 Smart SL) ***
-        stop_loss_price = self._round_price(ema50_4h - (atr_4h * Decimal('1.0'))) # Ставим SL на 1 ATR ниже EMA 50
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+        # (v9.9 Smart SL): Множитель 1.5 (по предложению)
+        stop_loss_price = self._round_price(ema50_4h - (atr_4h * Decimal('1.5'))) # Ставим SL на 1.5 ATR ниже EMA 50
         
         risk_per_coin = entry_price - stop_loss_price
         if risk_per_coin <= 0: return None
@@ -390,14 +411,13 @@ class TradingBot(threading.Thread):
         reward_per_coin = target_tp - entry_price
         if reward_per_coin <= 0: return None
         rr_ratio = reward_per_coin / risk_per_coin
-        self.log(f"    -> Кандидат (EMA Pullback): 1H паттерн на 4H EMA. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        self.log(f"    -> Кандидат (EMA Pullback): 1H паттерн (Vol/ATR+, RSI>50) на 4H EMA (ADX>25). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {"type": "EMA_CROSS", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     def _find_entry_rsi_divergence_4h(self, market_data, current_price):
-        # (ИЗМЕНЕНО v9.7: Smart SL)
+        # (ИЗМЕНЕНО v9.9: Добавлен ADX < 25, MACD Hist > 0, ATR SL 1.5)
         ind_4h = market_data.get('indicators_4h')
-        ind_1h = market_data.get('indicators_1h')
-        if ind_4h is None or ind_1h is None or len(ind_4h) < 40 or len(ind_1h) < 2: return None
+        if ind_4h is None or len(ind_4h) < 40: return None
         lookback_period = 30
         recent_data = ind_4h.iloc[-lookback_period:]
         rsi_lows = recent_data[(recent_data['RSI_14'] < recent_data['RSI_14'].shift(1)) & (recent_data['RSI_14'] < recent_data['RSI_14'].shift(-1))]
@@ -405,20 +425,34 @@ class TradingBot(threading.Thread):
         last_rsi_low_val, prev_rsi_low_val = rsi_lows.iloc[-1]['RSI_14'], rsi_lows.iloc[-2]['RSI_14']
         last_rsi_low_idx, prev_rsi_low_idx = rsi_lows.index[-1], rsi_lows.index[-2]
         if not (prev_rsi_low_val < 45): return None
-        if not (last_rsi_low_val > prev_rsi_low_val): return None
+        if not (last_rsi_low_val > prev_rsi_low_val): return None # Regular Bullish Div
         price_at_last_rsi_low, price_at_prev_rsi_low = recent_data.loc[last_rsi_low_idx]['low'], recent_data.loc[prev_rsi_low_idx]['low']
         if not (price_at_last_rsi_low < price_at_prev_rsi_low): return None
         is_recent_divergence = (ind_4h.index[-1] - last_rsi_low_idx) <= 5
         if not is_recent_divergence: return None
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.9 Filters) ***
+        try:
+            last_4h = ind_4h.iloc[-1]
+            adx_4h = Decimal(str(last_4h[f'ADX_{self.adx_len}']))
+            macd_hist_4h = Decimal(str(last_4h['MACDh_12_26_9']))
+            if adx_4h > 25: 
+                self.log("    -> ОТКЛОНЕНО (RSI Div): ADX > 25, не похоже на разворот."); return None
+            if macd_hist_4h < 0: 
+                self.log("    -> ОТКЛОНЕНО (RSI Div): MACD Histogram < 0, нет подтверждения."); return None
+        except (ValueError, KeyError): return None
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+
         entry_price = current_price
         stop_loss_ref_candle = recent_data.loc[last_rsi_low_idx]
         
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.7 Smart SL) ***
         try:
             atr_4h = Decimal(str(stop_loss_ref_candle[f'ATRr_{self.atr_period}']))
             divergence_low = Decimal(str(stop_loss_ref_candle['low']))
         except (KeyError, ValueError): return None
-        stop_loss_price = self._round_price(divergence_low - (atr_4h * Decimal('1.0'))) # Ставим SL на 1 ATR ниже минимума дивергенции
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.9 Smart SL): Множитель 1.5 (по предложению) ***
+        stop_loss_price = self._round_price(divergence_low - (atr_4h * Decimal('1.5'))) # Ставим SL на 1.5 ATR ниже минимума дивергенции
         # *** КОНЕЦ ИЗМЕНЕНИЯ ***
         
         risk_per_coin = entry_price - stop_loss_price
@@ -427,34 +461,48 @@ class TradingBot(threading.Thread):
         reward_per_coin = target_tp - entry_price
         if reward_per_coin <= 0: return None
         rr_ratio = reward_per_coin / risk_per_coin
-        self.log(f"    -> Кандидат (RSI Divergence): 4H дивергенция (БЕЗ 1H PA). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        self.log(f"    -> Кандидат (RSI Divergence): 4H дивергенция (ADX<25, MACD+). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {"type": "RSI_DIVERGENCE", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     def _find_entry_price_action_1h(self, market_data, current_price, key_levels):
-       # (ИЗМЕНЕНО v9.7: Smart SL)
+       # (ИЗМЕНЕНО v9.10: Используем Vol/ATR)
        ind_1h = market_data.get('indicators_1h')
-       if ind_1h is None or len(ind_1h) < 20: return None
+       if ind_1h is None or len(ind_1h) < (self.vol_sma_len + 1): return None
        signal_candle, prev_candle = ind_1h.iloc[-1], ind_1h.iloc[-2]
        is_hammer, is_engulfing = self._is_bullish_hammer(signal_candle), self._is_bullish_engulfing(prev_candle, signal_candle)
        if not (is_hammer or is_engulfing): return None
+       
+       # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: Vol/ATR) ***
        try:
            rsi_1h = Decimal(str(signal_candle['RSI_14']))
-           avg_volume = ind_1h['volume'].tail(10).mean()
-           signal_volume = Decimal(str(signal_candle['volume']))
+           
+           # Используем нормализованный объем (по предложению 2025)
+           avg_norm_volume = Decimal(str(prev_candle[f'NORM_VOL_SMA_{self.vol_sma_len}'])) # Среднее с *предыдущей* свечи
+           signal_norm_volume = Decimal(str(signal_candle['norm_volume']))
+           
            atr_1h = Decimal(str(signal_candle[f'ATRr_{self.atr_period}']))
-           signal_low = Decimal(str(signal_candle['low'])) # Low of the signal candle
+           signal_low = Decimal(str(signal_candle['low']))
            atr_perc = (atr_1h / current_price) * 100 if current_price > 0 else Decimal('0')
+           
+           adx_1h = Decimal(str(signal_candle[f'ADX_{self.adx_len}']))
+           if adx_1h > 20: 
+               self.log("    -> ОТКЛОНЕНО (PA 1H): ADX > 20, рынок в тренде, а не в 'range'."); return None
        except (ValueError, KeyError): return None
+       # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+       
        if rsi_1h <= 40 or rsi_1h >= 70: return None
        is_near_support = any(abs(current_price - support) / support < Decimal('0.02') for support in key_levels['supports'])
        if not is_near_support: return None
-       if signal_volume <= Decimal(str(avg_volume)): return None
+       
+       # *** ИЗМЕНЕНИЕ (v9.10): Проверка нормализованного объема ***
+       if signal_norm_volume <= avg_norm_volume: 
+           self.log("    -> ОТКЛОНЕНО (PA 1H): Низкий нормализованный объем (Vol/ATR) на сигнальной свече."); return None
        if atr_perc > 3: return None
+       
        entry_price = current_price
        
-       # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.7 Smart SL) ***
-       stop_loss_price = self._round_price(signal_low - (atr_1h * Decimal('1.0'))) # Ставим SL на 1 ATR ниже минимума сигнальной свечи
-       # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+       # (v9.7 Smart SL) - Без изменений (1.0 ATR)
+       stop_loss_price = self._round_price(signal_low - (atr_1h * Decimal('1.0')))
        
        risk_per_coin = entry_price - stop_loss_price
        if risk_per_coin <= 0: return None
@@ -464,11 +512,11 @@ class TradingBot(threading.Thread):
        if reward_per_coin <= 0: return None
        rr_ratio = reward_per_coin / risk_per_coin
        pattern_type = "hammer" if is_hammer else "engulfing"
-       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type}, RSI (40-70), у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+       self.log(f"    -> Кандидат (Price Action 1H): Паттерн {pattern_type} (ADX<20, Vol/ATR+), у поддержки. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
        return {"type": "PRICE_ACTION", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     def _find_entry_mean_reversion_4h(self, market_data, current_price):
-        # (v9.7 - Без изменений SL, тут 1.5 ATR уже используется)
+        # (ИЗМЕНЕНО v9.10: Добавлены MACD+ и DI+ > DI- фильтры)
         ind_4h = market_data.get('indicators_4h')
         if ind_4h is None or len(ind_4h) < (self.bb_len + 1): return None
         last_4h = ind_4h.iloc[-1]
@@ -479,29 +527,52 @@ class TradingBot(threading.Thread):
             lower_bb = Decimal(str(last_4h[f'BBL_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
             middle_bb = Decimal(str(last_4h[f'BBM_{self.bb_len}_{self.bb_std}_{self.bb_std}']))
             atr_4h = Decimal(str(last_4h[f'ATRr_{self.atr_period}']))
+            # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10): Доп. фильтры (по предложению 2025) ***
+            di_plus = Decimal(str(last_4h[f'DMP_{self.adx_len}']))
+            di_minus = Decimal(str(last_4h[f'DMN_{self.adx_len}']))
+            macd_hist = Decimal(str(last_4h['MACDh_12_26_9']))
+            # *** КОНЕЦ ИЗМЕНЕНИЯ ***
         except (ValueError, KeyError): return None
-        if adx >= 30: return None
-        if rsi >= 40: return None
+        
+        # (v9.9 Filter): ADX < 20
+        if adx >= 20: 
+            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): ADX ({adx:.1f}) >= 20, рынок в тренде."); return None
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10): Доп. фильтры (по предложению 2025) ***
+        if macd_hist < 0:
+            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): MACD Hist ({macd_hist:.2f}) < 0, нет бычьего подтверждения."); return None
+        if di_plus <= di_minus:
+            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): DI+ ({di_plus:.1f}) <= DI- ({di_minus:.1f}), нет бычьего направления."); return None
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+
+        # (v9.9 Filter): RSI < 30
+        if rsi >= 30: 
+            self.log(f"    -> ОТКЛОНЕНО (Mean Rev): RSI ({rsi:.1f}) >= 30, не в зоне 'oversold'."); return None
+
         is_pierced = low_price < (lower_bb * Decimal('0.995'))
         is_at_band = (current_price >= lower_bb) and (low_price < lower_bb)
         if not (is_pierced or is_at_band): return None
         entry_price = current_price
-        stop_loss_price = self._round_price(low_price - (atr_4h * self.atr_multiplier_sl)) # Используем atr_multiplier_sl = 1.5
+        
+        # (v9.9 Smart SL): Множитель 2.0 (через self.atr_multiplier_sl)
+        stop_loss_price = self._round_price(low_price - (atr_4h * self.atr_multiplier_sl)) # Используем self.atr_multiplier_sl = 2.0
+        
         risk_per_coin = entry_price - stop_loss_price
         if risk_per_coin <= 0: return None
         target_tp = self._round_price(middle_bb)
         reward_per_coin = target_tp - entry_price
         if reward_per_coin <= 0: return None
         rr_ratio = reward_per_coin / risk_per_coin
-        self.log(f"    -> Кандидат (Mean Reversion): Возврат в BB. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        # *** ИЗМЕНЕНИЕ (v9.10): Обновлен лог ***
+        self.log(f"    -> Кандидат (Mean Reversion): Возврат в BB (ADX<20, RSI<30, MACD+, DI+). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {"type": "MEAN_REVERSION", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     def _find_entry_breakout_retest_4h(self, market_data, current_price, key_levels, is_1d_bull_trend):
-        # (ИЗМЕНЕНО v9.7: Smart SL)
+        # (ИЗМЕНЕНО v9.10: Используем Vol/ATR)
         if not is_1d_bull_trend: return None
         ind_4h = market_data.get('indicators_4h')
         ind_1h = market_data.get('indicators_1h')
-        if ind_4h is None or ind_1h is None or len(ind_4h) < 30 or len(ind_1h) < 2: return None
+        if ind_4h is None or ind_1h is None or len(ind_4h) < 30 or len(ind_1h) < (self.vol_sma_len + 1): return None
         
         prev_4h = ind_4h.iloc[-2]
         signal_1h, prev_1h = ind_1h.iloc[-1], ind_1h.iloc[-2]
@@ -523,11 +594,21 @@ class TradingBot(threading.Thread):
         is_hammer, is_engulfing = self._is_bullish_hammer(signal_1h), self._is_bullish_engulfing(prev_1h, signal_1h)
         if not (is_hammer or is_engulfing): return None
         
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: Vol/ATR) ***
+        try:
+            # Используем нормализованный объем (по предложению 2025)
+            signal_norm_vol_1h = Decimal(str(signal_1h['norm_volume']))
+            avg_norm_vol_1h = Decimal(str(prev_1h[f'NORM_VOL_SMA_{self.vol_sma_len}'])) # Среднее с *предыдущей* свечи
+            
+            if signal_norm_vol_1h <= avg_norm_vol_1h: 
+                self.log("    -> ОТКЛОНЕНО (Breakout): Низкий нормализованный объем (Vol/ATR) на 1H PA свече ретеста."); return None
+        except (ValueError, KeyError): return None
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+
         entry_price = current_price
         
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.7 Smart SL) ***
-        stop_loss_price = self._round_price(signal_1h_low - (atr_1h * Decimal('1.0'))) # Ставим SL на 1 ATR ниже минимума сигнальной свечи
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+        # (v9.7 Smart SL) - Без изменений (1.0 ATR)
+        stop_loss_price = self._round_price(signal_1h_low - (atr_1h * Decimal('1.0')))
         
         risk_per_coin = entry_price - stop_loss_price
         if risk_per_coin <= 0: return None
@@ -547,11 +628,11 @@ class TradingBot(threading.Thread):
             reward_per_coin = risk_per_coin * rr_ratio
             target_tp = self._round_price(entry_price + reward_per_coin)
         
-        self.log(f"    -> Кандидат (Breakout & Retest): 1H паттерн на 4H KC ретесте. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        self.log(f"    -> Кандидат (Breakout & Retest): 1H паттерн (Vol/ATR+) на 4H KC ретесте. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {"type": "BREAKOUT_4H", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     def _find_entry_momentum_pullback_1h(self, market_data, current_price, key_levels, is_1d_bull_trend):
-        # (ИЗМЕНЕНО v9.7: Smart SL)
+        # (ИЗМЕНЕНО v9.10: ADX > 35)
         if not is_1d_bull_trend: return None
         ind_1h = market_data.get('indicators_1h')
         ind_4h = market_data.get('indicators_4h')
@@ -565,8 +646,19 @@ class TradingBot(threading.Thread):
             if price_4h <= ema_50_4h: return None
             ema_9_1h = Decimal(str(last_1h[f'EMA_{self.ema_superfast_len}']))
             ema_21_1h = Decimal(str(last_1h[f'EMA_{self.ema_fast_len}']))
-            atr_1h = Decimal(str(last_1h[f'ATRr_{self.atr_period}'])) # ATR for SL calculation
+            atr_1h = Decimal(str(last_1h[f'ATRr_{self.atr_period}'])) 
             if ema_9_1h <= ema_21_1h: return None
+            
+            # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10 Filters: ADX > 35) ***
+            adx_1h = Decimal(str(last_1h[f'ADX_{self.adx_len}']))
+            rsi_1h = Decimal(str(last_1h['RSI_14']))
+            # (v9.10): ADX > 35 (по предложению 2025)
+            if adx_1h < 35: 
+                self.log(f"    -> ОТКЛОНЕНО (Momentum): ADX ({adx_1h:.1f}) < 35, импульс не подтвержден."); return None
+            if rsi_1h < 50: 
+                self.log(f"    -> ОТКЛОНЕНО (Momentum): RSI ({rsi_1h:.1f}) < 50, нет бычьего моментума."); return None
+            # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+
             if current_price > (ema_21_1h * Decimal('1.003')): return None
             stoch_k_1h = Decimal(str(last_1h['STOCHRSIk_14_14_3_3']))
             stoch_d_1h = Decimal(str(last_1h['STOCHRSId_14_14_3_3']))
@@ -577,9 +669,8 @@ class TradingBot(threading.Thread):
         
         entry_price = current_price
         
-        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.7 Smart SL) ***
-        stop_loss_price = self._round_price(ema_21_1h - (atr_1h * Decimal('1.0'))) # Ставим SL на 1 ATR ниже EMA 21
-        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+        # (v9.7 Smart SL) - Без изменений (1.0 ATR)
+        stop_loss_price = self._round_price(ema_21_1h - (atr_1h * Decimal('1.0'))) 
         
         risk_per_coin = entry_price - stop_loss_price
         if risk_per_coin <= 0: return None
@@ -600,7 +691,7 @@ class TradingBot(threading.Thread):
             reward_per_coin = risk_per_coin * rr_ratio
             target_tp = self._round_price(entry_price + reward_per_coin)
         
-        self.log(f"    -> Кандидат (Momentum Pullback): StochRSI откат в 1H/4H аптренде. SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        self.log(f"    -> Кандидат (Momentum Pullback): StochRSI откат (ADX>35, RSI>50). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
         return {"type": "MOMENTUM_1H", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
     
     # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -724,7 +815,7 @@ class TradingBot(threading.Thread):
             self.log(f"КРИТИЧЕСКАЯ ОШИБКА при открытии позиции: {e}"); self._reset_position_state()
 
     # ---
-    # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (v9.2 - Убраны выходы по RSI) ---
+    # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (v9.9 - Добавлен выход по ADX для Momentum) ---
     # ---
     def _check_and_manage_exit_conditions(self, market_data, current_price, current_high, current_low, current_1m_candle):
         if not self.position_side: return
@@ -748,6 +839,19 @@ class TradingBot(threading.Thread):
             if self.sl_confirmation_counter > 0:
                 self.log(f"ИНФО: Условие SL больше не выполняется. Cброс счетчика подтверждения ({self.sl_confirmation_counter} -> 0).")
                 self.sl_confirmation_counter = 0; self._save_state()
+        
+        # (v9.9): Выход по угасанию Momentum (ADX < 25)
+        if self.current_trade_strategy_type == "MOMENTUM_1H":
+            try:
+                ind_1h = market_data.get('indicators_1h')
+                if ind_1h is not None and not ind_1h.empty:
+                    adx_1h = Decimal(str(ind_1h.iloc[-1][f'ADX_{self.adx_len}']))
+                    if adx_1h < 25:
+                        self.log(f"ВЫХОД (Momentum): 1H ADX ({adx_1h:.1f}) упал < 25. Импульс иссяк.")
+                        self._close_position(reason="MOMENTUM EXIT (ADX<25)", is_partial=False, execution_price=current_open)
+                        return
+            except (ValueError, KeyError, IndexError):
+                pass # Игнорируем ошибку индикатора, пусть SL/TP отработают
         
         # 2. Управление по Времени
         if self.entry_time and not self.is_tp1_hit:
@@ -965,7 +1069,7 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"Ошибка получения данных: {e}"); return None
 
     def _calculate_indicators(self, klines):
-        # (Эта функция без изменений)
+        # (ИЗМЕНЕНО v9.10: Добавлен MACD, Нормализованный Объем)
         if not klines or len(klines) < 50: return pd.DataFrame()
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'trades', 'tbav', 'tqav', 'ig'])
         for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col])
@@ -973,7 +1077,21 @@ class TradingBot(threading.Thread):
         df.ta.rsi(length=14, append=True); df.ta.atr(length=self.atr_period, append=True); df.ta.stochrsi(append=True)
         df.ta.adx(length=self.adx_len, append=True)
         df.ta.bbands(length=self.bb_len, std=self.bb_std, append=True); df.ta.kc(length=self.kc_len, scalar=self.kc_scalar, append=True)
+        
         df[f'VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['volume'], length=self.vol_sma_len)
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v9.10): Нормализованный объем (по предложению 2025) ***
+        atr_col = f'ATRr_{self.atr_period}'
+        # Заполняем NaN и 0, чтобы избежать ошибок деления
+        safe_atr = df[atr_col].replace(0, np.nan).fillna(method='ffill').fillna(1) 
+        safe_atr[safe_atr == 0] = 1 # Убедимся, что 0 нет
+        df['norm_volume'] = df['volume'] / safe_atr
+        df[f'NORM_VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['norm_volume'], length=self.vol_sma_len)
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+        
+        # (v9.9 Filters)
+        df.ta.macd(append=True) # Расчет MACD
+        
         return df
     
     def _log_daily_status(self, reason):

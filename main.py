@@ -38,7 +38,8 @@ except ImportError:
     exit()
 
 # --- Импорт кастомных классов из других файлов ---
-from trading_bot import TradingBot
+# (Предполагается, что trading_bot.py - это v9.9)
+from trading_bot import TradingBot 
 from mock_binance_client import MockBinanceClient
 
 
@@ -46,7 +47,7 @@ from mock_binance_client import MockBinanceClient
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Multi-Strategy Trader v8.6 (Configurable)")
+        self.root.title("Multi-Strategy Trader v9.9 (Configurable + Filters)")
         self.root.geometry("1440x900") # Ширина x Высота
         self.root.bind("<Configure>", self._resize_columns)
         self.event_queue = queue.Queue()
@@ -55,7 +56,7 @@ class App:
         self.trade_view_items = {}
         self.total_pnl_history = {}
         
-        # *** НОВОЕ: Словарь для хранения Checkbutton-ов и их переменных ***
+        # *** Словарь для хранения Checkbutton-ов и их переменных ***
         self.strategy_vars = {}
         self.strategy_checkboxes = {}
         
@@ -64,7 +65,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _create_widgets(self):
-        # *** ИЗМЕНЕНО: Полностью переработанная компоновка GUI ***
+        # *** Компоновка GUI ***
         style = ttk.Style(); style.theme_use('clam')
         style.configure("TLabel", padding=3, foreground="#333333", background="#f8f9fa")
         style.configure("TButton", padding=3, background="#007bff", foreground="white")
@@ -132,9 +133,10 @@ class App:
         tk.Label(settings_frame, text="Риск на сделку (%):").grid(row=2, column=0, sticky="w", padx=3, pady=3)
         self.risk_per_trade_var = tk.StringVar(value="1"); ttk.Entry(settings_frame, textvariable=self.risk_per_trade_var, width=8).grid(row=2, column=1, sticky="w", padx=3, pady=3)
         tk.Label(settings_frame, text="Базовый R/R:").grid(row=3, column=0, sticky="w", padx=3, pady=3)
-        self.rr_ratio_var = tk.StringVar(value="1.3"); ttk.Entry(settings_frame, textvariable=self.rr_ratio_var, width=8).grid(row=3, column=1, sticky="w", padx=3, pady=3)
+        # *** ИЗМЕНЕНИЕ (v9.9): Обновлено значение по умолчанию до 2.0 ***
+        self.rr_ratio_var = tk.StringVar(value="2.0"); ttk.Entry(settings_frame, textvariable=self.rr_ratio_var, width=8).grid(row=3, column=1, sticky="w", padx=3, pady=3)
 
-        # --- НОВЫЙ ФРЕЙМ: Конфигурация стратегий ---
+        # --- ФРЕЙМ: Конфигурация стратегий ---
         strategy_config_frame = ttk.LabelFrame(scrollable_frame, text="Активные стратегии"); 
         strategy_config_frame.pack(fill="x", padx=3, pady=5, ipady=3)
         
@@ -149,7 +151,7 @@ class App:
             chk.pack(anchor="w", padx=5)
             self.strategy_vars[stype] = var
             self.strategy_checkboxes[stype] = chk
-        # --- КОНЕЦ НОВОГО ФРЕЙМА ---
+        # --- КОНЕЦ ФРЕЙМА ---
 
         backtest_frame = ttk.LabelFrame(scrollable_frame, text="Бэктестинг"); backtest_frame.pack(fill="x", padx=3, pady=5, ipady=3); backtest_frame.columnconfigure(1, weight=1)
         tk.Label(backtest_frame, text="Стартовый баланс (USDT):").grid(row=0, column=0, sticky="w", padx=3, pady=3)
@@ -218,10 +220,16 @@ class App:
     def _validate_common_settings(self):
         # (Эта функция без изменений)
         try:
-            if not 0 < float(self.risk_per_trade_var.get()) <= 10: raise ValueError
-            if not 0 < float(self.rr_ratio_var.get()): raise ValueError
+            if not 0 < float(self.risk_per_trade_var.get()) <= 10: raise ValueError("Risk must be 0-10")
+            # *** ИЗМЕНЕНИЕ (v9.9): Проверка R:R >= 2.0 (согласно новой логике) ***
+            if not float(self.rr_ratio_var.get()) >= 2.0: raise ValueError("R:R must be >= 2.0")
             datetime.strptime(self.start_date_var.get(), '%Y-%m-%d')
-        except ValueError: messagebox.showerror("Ошибка", "Риск должен быть числом (0-10), R:R > 0, дата в формате YYYY-MM-DD."); return False
+        except ValueError as e: 
+            if "R:R" in str(e):
+                messagebox.showerror("Ошибка", "Базовый R:R должен быть числом >= 2.0 (согласно новой логике v9.9).")
+            else:
+                messagebox.showerror("Ошибка", "Риск должен быть числом (0-10), R:R >= 2.0, дата в формате YYYY-MM-DD.")
+            return False
         if not self.symbol_var.get().strip(): messagebox.showerror("Ошибка", "Пожалуйста, введите торговую пару."); return False
         return True
     
@@ -236,7 +244,7 @@ class App:
             self.strategy_labels[stype]['wr'].config(text="N/A")
         self.status_bar.config(text="Статус: Очистка...")
     
-    # *** ИЗМЕНЕНО: Сбор данных с галочек перед стартом ***
+    # *** Сбор данных с галочек перед стартом ***
     def _get_active_strategies_config(self):
         config = {stype: var.get() for stype, var in self.strategy_vars.items()}
         if not any(config.values()):
@@ -249,13 +257,13 @@ class App:
         if not messagebox.askokcancel("ПОДТВЕРЖДЕНИЕ", "Вы уверены, что хотите запустить бота в режиме РЕАЛЬНОЙ ТОРГОВЛИ?"): return
         
         self._clear_previous_run(); self._set_controls_running(True)
-        active_strategies = self._get_active_strategies_config() # НОВОЕ
+        active_strategies = self._get_active_strategies_config()
         
         bot_args = {
             "api_key": self.binance_key_entry.get(), "api_secret": self.binance_secret_entry.get(), 
             "event_queue": self.event_queue, "risk_per_trade": self.risk_per_trade_var.get(), 
             "rr_ratio": self.rr_ratio_var.get(), "symbol": self.symbol_var.get(),
-            "active_strategies_config": active_strategies # НОВОЕ
+            "active_strategies_config": active_strategies
         }
         self.bot_thread = TradingBot(**bot_args); self.bot_thread.start()
     
@@ -266,12 +274,12 @@ class App:
         except ValueError: messagebox.showerror("Ошибка", "Начальный баланс должен быть положительным числом."); return
         
         self._clear_previous_run(); self._set_controls_running(True)
-        self.active_strategies_config = self._get_active_strategies_config() # НОВОЕ
+        self.active_strategies_config = self._get_active_strategies_config()
         
         threading.Thread(target=self._run_backtest_flow, args=(float(self.initial_balance_var.get()),), daemon=True).start()
         
     def _run_backtest_flow(self, initial_balance):
-        # *** ИЗМЕНЕНО: Передача active_strategies_config в mock-бота ***
+        # *** Передача active_strategies_config в mock-бота ***
         try:
             df_1m = self._get_backtest_data()
             if df_1m is None or df_1m.empty: 
@@ -296,7 +304,7 @@ class App:
                 "api_key": "mock", "api_secret": "mock", "event_queue": self.event_queue, 
                 "risk_per_trade": self.risk_per_trade_var.get(), "rr_ratio": self.rr_ratio_var.get(), 
                 "symbol": symbol_str, "backtest_client": mock_client,
-                "active_strategies_config": self.active_strategies_config # НОВОЕ
+                "active_strategies_config": self.active_strategies_config
             }
             self.bot_thread = TradingBot(**bot_args); self.bot_thread.start(); self.bot_thread.join()
         except Exception as e:
@@ -354,7 +362,7 @@ class App:
         self._set_controls_running(False)
     
     def _set_controls_running(self, is_running):
-        # *** ИЗМЕНЕНО: Добавлена блокировка галочек ***
+        # *** Добавлена блокировка галочек ***
         state = "disabled" if is_running else "normal"
         self.start_button.config(state=state); self.start_backtest_button.config(state=state)
         self.stop_button.config(state="normal" if is_running else "disabled")
@@ -373,7 +381,17 @@ class App:
                 if event_type == 'log':
                     log_msg = event['data']
                     if not (self.bot_thread and self.bot_thread.is_backtest): log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] {event['data']}"
-                    self.log_text.config(state="normal"); self.log_text.insert(tk.END, f"{log_msg}\n"); self.log_text.config(state="disabled"); self.log_text.see(tk.END)
+                    
+                    # (Логируем 'ОТКЛОНЕНО' и 'КАДИДАТ' менее ярко)
+                    color = "orange" if "ОТКЛОНЕНО" in log_msg else ("cyan" if "-> Кандидат" in log_msg else "#ecf0f1")
+                    
+                    self.log_text.config(state="normal")
+                    self.log_text.insert(tk.END, f"{log_msg}\n", (color,))
+                    self.log_text.tag_config("orange", foreground="#f39c12")
+                    self.log_text.tag_config("cyan", foreground="#1abc9c")
+                    self.log_text.tag_config("#ecf0f1", foreground="#ecf0f1")
+                    self.log_text.config(state="disabled"); self.log_text.see(tk.END)
+                    
                 elif event_type == 'dashboard_update':
                     for key, value in event_data.items():
                         if key in self.dashboard_labels: self.dashboard_labels[key].config(text=value)
@@ -382,27 +400,24 @@ class App:
                     values = (trade_id, event_data['strategy'], event_data['side'], event_data['entry_time'], event_data['entry_price'], event_data['quantity'], '...', '...', '...')
                     item_id = self.trades_tree.insert("", 0, values=values); self.trade_view_items[trade_id] = item_id
                 
-                # --- БЛОК ИСПРАВЛЕНИЯ ---
+                # --- БЛОК ИСПРАВЛЕНИЯ (v8.6) ---
                 elif event_type == 'update_trade':
                     trade_id = event_data['trade_id']; item_id = self.trade_view_items.get(trade_id)
                     if item_id:
-                        # --- ИЗМЕНЕНИЕ: Исправлена логика обновления строки сделки ---
+                        # --- Исправлена логика обновления строки сделки ---
                         self.total_pnl_history[trade_id] += Decimal(event_data['pnl']);
                         total_pnl_for_trade = self.total_pnl_history[trade_id]
 
                         pnl_text = f"{total_pnl_for_trade:+.2f}"
                         
                         # Получаем оставшееся кол-во (из trading_bot.py)
-                        # current_values[5] - это старое кол-во
                         current_quantity_str = event_data.get('remaining_quantity')
 
                         # Если это частичное закрытие
                         if event_data.get('is_partial') == True:
                             pnl_text += " (TP1)"
-                            # current_quantity_str уже содержит *оставшееся* кол-во
                         else:
                             # Это полное закрытие.
-                            # 'pnl_text' уже содержит *итоговый* PnL
                             current_quantity_str = f"0.0" # Явно ставим 0
                         
                         current_values = self.trades_tree.item(item_id)['values']
@@ -419,7 +434,6 @@ class App:
                             pnl_text                 # Обновленный PnL
                         )
                         self.trades_tree.item(item_id, values=updated_values)
-                        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
                 # --- КОНЕЦ БЛОКА ИСПРАВЛЕНИЯ ---
                         
                 elif event_type == 'strategy_stats_update':
