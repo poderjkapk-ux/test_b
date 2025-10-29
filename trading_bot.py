@@ -32,7 +32,7 @@ except ImportError:
 STATE_FILE = "bot_state_multi_strategy.json"
 
 
-# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v1.0 Scalping 2025) ---
+# --- ОСНОВНОЙ КЛАСС ЛОГИКИ БОТА (v1.1 Scalping 2025 - 6 стратегий) ---
 class TradingBot(threading.Thread):
     
     def __init__(self, api_key, api_secret, event_queue, risk_per_trade, rr_ratio, symbol, active_strategies_config, backtest_client=None):
@@ -85,10 +85,16 @@ class TradingBot(threading.Thread):
         self.current_trade_id = None
         self.current_trade_pnl = Decimal('0.0')
 
-        # --- Статистика по стратегиям (SCALPING) ---
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.1): Добавлены новые стратегии ***
         self.strategy_types = [
-            "SCALP_LIQUIDITY_SWEEP_3M", "SCALP_RSI_VOLUME_5M", "SCALP_BREAKOUT_CONFIRM_1M", "UNKNOWN"
+            "SCALP_LIQUIDITY_SWEEP_3M", "SCALP_RSI_VOLUME_5M", "SCALP_BREAKOUT_CONFIRM_1M",
+            "SCALP_PRICE_ACTION_1M",
+            "SCALP_MOMENTUM_BREAK_3M",
+            "SCALP_BOLLINGER_TOUCH_5M",
+            "UNKNOWN"
         ]
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+        
         self.pnl_by_strategy = {stype: Decimal('0.0') for stype in self.strategy_types}
         self.wins_by_strategy = {stype: 0 for stype in self.strategy_types}
         self.losses_by_strategy = {stype: 0 for stype in self.strategy_types}
@@ -107,6 +113,15 @@ class TradingBot(threading.Thread):
         self.adx_len = 14
         self.vol_sma_len = 20
         # MACD/StochRSI параметры используются по умолчанию в pandas_ta
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.1): Параметры для новых индикаторов ***
+        self.bb_len = 20
+        self.bb_std = 2.0
+        self.rsi_period = 14 # (Уже используется, но подтверждено)
+        self.stoch_period = 14
+        self.stoch_k = 3
+        self.stoch_d = 3
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
         
         self.last_heartbeat_log_time = time.time()
         self.last_hour_checked = None # Используем для 1-минутных проверок
@@ -159,8 +174,11 @@ class TradingBot(threading.Thread):
             self.current_trade_strategy_type = state.get('current_trade_strategy_type', "UNKNOWN")
             entry_time_str = state.get('entry_time')
             if entry_time_str:
-                try: self.entry_time = datetime.fromisoformat(entry_time_str)
-                except ValueError: self.entry_time = None; self.log("Предупреждение: неверный формат даты в файле состояния.")
+                try: 
+                    # (Рекомендация по анализу: добавляем .replace(tzinfo=UTC))
+                    self.entry_time = datetime.fromisoformat(entry_time_str).replace(tzinfo=UTC)
+                except ValueError: 
+                    self.entry_time = None; self.log("Предупреждение: неверный формат даты в файле состояния.")
             else: self.entry_time = None
             self.total_pnl_usdt = Decimal(state.get('total_pnl_usdt', '0.0'))
             self.total_fees_paid_usdt = Decimal(state.get('total_fees_paid_usdt', '0.0'))
@@ -169,7 +187,7 @@ class TradingBot(threading.Thread):
             self.trade_counter = state.get('trade_counter', 0)
             self.current_trade_id = state.get('current_trade_id', None)
             
-            # (Обновлено для новых стратегий)
+            # (Обновлено для новых стратегий v1.1)
             pnl_by_strategy_str = state.get('pnl_by_strategy', {})
             self.pnl_by_strategy = {stype: Decimal(pnl_by_strategy_str.get(stype, '0.0')) for stype in self.strategy_types}
             self.wins_by_strategy = state.get('wins_by_strategy', {stype: 0 for stype in self.strategy_types})
@@ -184,8 +202,8 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"ОШИБКА: Не удалось загрузить состояние бота: {e}")
 
     def run(self):
-        # *** ИЗМЕНЕНИЕ (v1.0 Scalp) ***
-        bot_name = "Scalping Bot v1.0 (2025 Filters)"
+        # *** ИЗМЕНЕНИЕ (v1.1 Scalp) ***
+        bot_name = "Scalping Bot v1.1 (2025 Filters - 6 Strategies)"
         mode = "БЭКТЕСТ (1M)" if self.is_backtest else "РЕАЛЬНАЯ ТОРГОВЛЯ" 
         self.log(f"Запуск бота '{bot_name}' в режиме '{mode}' для символа {self.symbol}...")
         
@@ -220,8 +238,9 @@ class TradingBot(threading.Thread):
                 if not self.is_backtest:
                     current_high = current_price; current_low = current_price
                 
-                if not self.is_backtest or (tick_counter % 1 == 0): # Обновляем GUI каждую минуту в бэктесте
-                    self._update_dashboard_data(market_data, current_price)
+                # *** ИСПРАВЛЕНИЕ (v1.1): Удалена избыточная проверка (tick_counter % 1 == 0) ***
+                # Обновляем GUI каждую минуту в бэктесте (т.е. каждый тик) или в реальном времени.
+                self._update_dashboard_data(market_data, current_price)
                 
                 if should_check_logic:
                     self.last_hour_checked = current_minute
@@ -287,43 +306,65 @@ class TradingBot(threading.Thread):
             self.log(f"Ошибка в логе Heartbeat: {e}")
 
     # ---
-    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v1.0 Scalp) ---
+    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ (v1.1 Scalp - 6 стратегий) ---
     # ---
     def _get_algorithmic_decision(self, market_data, current_price):
         
         # (Фильтр 1D Тренда оставлен, т.к. одна из стратегий его использует)
         ind_1d = market_data.get('indicators_1d')
         is_1d_bull_trend = False
-        if ind_1d is None or len(ind_1d) < self.ema_trend_len:
+        
+        # (Проверка на пустой DF из анализа)
+        if ind_1d is None or ind_1d.empty or len(ind_1d) < self.ema_trend_len:
             reason = f"Ожидание данных для 1D ({len(ind_1d) if ind_1d is not None else 0}/{self.ema_trend_len})"
             self._log_daily_status(reason); return None
         try:
             price_1d = Decimal(str(ind_1d.iloc[-1]['close']))
             ema200_1d = Decimal(str(ind_1d.iloc[-1][f'EMA_{self.ema_trend_len}']))
             is_1d_bull_trend = price_1d > ema200_1d
-        except ValueError:
+        except (ValueError, KeyError, IndexError):
             self.log("Предупреждение: Недопустимые данные в индикаторах 1D. Пропуск."); return None
 
         self._log_daily_status(f"1D Тренд: {'' if is_1d_bull_trend else 'НЕ '}Бычий. Поиск Scalp-сигналов...")
 
         # (Удален _get_key_levels)
 
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.1): Добавлены новые стратегии ***
         signals = {
             "SCALP_LIQUIDITY_SWEEP_3M": None, 
             "SCALP_RSI_VOLUME_5M": None, 
-            "SCALP_BREAKOUT_CONFIRM_1M": None
+            "SCALP_BREAKOUT_CONFIRM_1M": None,
+            "SCALP_PRICE_ACTION_1M": None,
+            "SCALP_MOMENTUM_BREAK_3M": None,
+            "SCALP_BOLLINGER_TOUCH_5M": None
         }
         
+        # (Существующие стратегии)
         if self.active_strategies.get("SCALP_LIQUIDITY_SWEEP_3M", False):
             signals["SCALP_LIQUIDITY_SWEEP_3M"] = self._find_entry_scalp_sweep_3m(market_data, current_price)
         if self.active_strategies.get("SCALP_RSI_VOLUME_5M", False):
             signals["SCALP_RSI_VOLUME_5M"] = self._find_entry_scalp_rsi_vol_5m(market_data, current_price)
         if self.active_strategies.get("SCALP_BREAKOUT_CONFIRM_1M", False):
             signals["SCALP_BREAKOUT_CONFIRM_1M"] = self._find_entry_scalp_breakout_1m(market_data, current_price)
+            
+        # (Новые стратегии v1.1)
+        if self.active_strategies.get("SCALP_PRICE_ACTION_1M", False):
+            signals["SCALP_PRICE_ACTION_1M"] = self._find_entry_scalp_price_action_1m(market_data, current_price)
+        if self.active_strategies.get("SCALP_MOMENTUM_BREAK_3M", False):
+            signals["SCALP_MOMENTUM_BREAK_3M"] = self._find_entry_scalp_momentum_break_3m(market_data, current_price)
+        if self.active_strategies.get("SCALP_BOLLINGER_TOUCH_5M", False):
+            signals["SCALP_BOLLINGER_TOUCH_5M"] = self._find_entry_scalp_bollinger_touch_5m(market_data, current_price)
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
         
         # --- УРОВЕНЬ 3: Скальпинг-Сигналы ---
         # (Все стратегии имеют одинаковый приоритет (Tier 3), выбираем лучший R/R)
-        tier_3_signals = [signals["SCALP_LIQUIDITY_SWEEP_3M"], signals["SCALP_RSI_VOLUME_5M"], signals["SCALP_BREAKOUT_CONFIRM_1M"]]
+        
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.1): Обновленный список Tier 3 ***
+        tier_3_signals = [
+            signals["SCALP_LIQUIDITY_SWEEP_3M"], signals["SCALP_RSI_VOLUME_5M"], signals["SCALP_BREAKOUT_CONFIRM_1M"],
+            signals["SCALP_PRICE_ACTION_1M"], signals["SCALP_MOMENTUM_BREAK_3M"], signals["SCALP_BOLLINGER_TOUCH_5M"]
+        ]
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
         
         # (Проверяем R/R >= self.base_rr_ratio, который теперь 1.0 или 1.2)
         valid_tier_3 = [s for s in tier_3_signals if s and s.get('rr_ratio', Decimal('0')) >= self.base_rr_ratio]
@@ -341,13 +382,14 @@ class TradingBot(threading.Thread):
     # ---
 
     # ---
-    # --- НОВЫЕ СТРАТЕГИИ (v1.0 Scalp) ---
+    # --- СУЩЕСТВУЮЩИЕ СТРАТЕГИИ (v1.0 Scalp) ---
     # ---
 
     def _find_entry_scalp_sweep_3m(self, market_data, current_price):
         ind_3m = market_data.get('indicators_3m')
         ind_15m = market_data.get('indicators_15m')
-        if ind_3m is None or ind_15m is None or len(ind_3m) < 21 or len(ind_15m) < self.ema_trend_len:
+        # (Проверка на пустой DF из анализа)
+        if ind_3m is None or ind_3m.empty or ind_15m is None or ind_15m.empty or len(ind_3m) < 21 or len(ind_15m) < self.ema_trend_len:
             return None
         
         # 1. Глобальный фильтр (15m TF)
@@ -357,7 +399,7 @@ class TradingBot(threading.Thread):
             if price_15m <= ema200_15m:
                 # self.log("    -> ОТКЛОНЕНО (SWEEP 3M): Цена ниже EMA 200 на 15M.")
                 return None
-        except (ValueError, KeyError): return None
+        except (ValueError, KeyError, IndexError): return None
         
         # 2. Анализ 3M
         try:
@@ -423,7 +465,8 @@ class TradingBot(threading.Thread):
 
     def _find_entry_scalp_rsi_vol_5m(self, market_data, current_price):
         ind_5m = market_data.get('indicators_5m')
-        if ind_5m is None or len(ind_5m) < (self.vol_sma_len + 2):
+        # (Проверка на пустой DF из анализа)
+        if ind_5m is None or ind_5m.empty or len(ind_5m) < (self.vol_sma_len + 2):
             return None
         
         try:
@@ -487,7 +530,8 @@ class TradingBot(threading.Thread):
 
     def _find_entry_scalp_breakout_1m(self, market_data, current_price):
         ind_1m = market_data.get('indicators_1m')
-        if ind_1m is None or len(ind_1m) < (self.vol_sma_len + 2):
+        # (Проверка на пустой DF из анализа)
+        if ind_1m is None or ind_1m.empty or len(ind_1m) < (self.vol_sma_len + 11):
             return None
             
         try:
@@ -552,6 +596,222 @@ class TradingBot(threading.Thread):
         return {"type": "SCALP_BREAKOUT_CONFIRM_1M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
 
     # ---
+    # --- *** НАЧАЛО: НОВЫЕ СТРАТЕГИИ v1.1 *** ---
+    # ---
+
+    def _find_entry_scalp_price_action_1m(self, market_data, current_price):
+        ind_1m = market_data.get('indicators_1m')
+        # (Проверка на пустой DF из анализа)
+        if ind_1m is None or ind_1m.empty or len(ind_1m) < (self.vol_sma_len + 5): # (Нужен запас для rolling_low)
+            return None
+            
+        try:
+            last_candle = ind_1m.iloc[-1]
+            
+            # 1. Price Action Signal
+            is_bull_engulf = last_candle.get('bull_engulf', False)
+            is_pin_bar = last_candle.get('pin_bar', False)
+            
+            if not (is_bull_engulf or is_pin_bar):
+                return None
+                
+            # 2. Volume Filter
+            norm_vol = Decimal(str(last_candle['norm_volume']))
+            avg_norm_vol = Decimal(str(last_candle[f'NORM_VOL_SMA_{self.vol_sma_len}']))
+            
+            if norm_vol <= (avg_norm_vol * Decimal('1.4')):
+                # self.log(f"    -> ОТКЛОНЕНО (PA 1M): Низкий Norm. Volume ({norm_vol:.2f} <= {avg_norm_vol*Decimal('1.4'):.2f})")
+                return None
+
+            # 3. RSI Confirmation
+            rsi = Decimal(str(last_candle['RSI_14']))
+            if rsi >= 35:
+                # self.log(f"    -> ОТКЛОНЕНО (PA 1M): RSI не в зоне oversold ({rsi:.1f} >= 35)")
+                return None
+                
+            # 4. Micro-trend Filter
+            ema_10 = Decimal(str(last_candle[f'EMA_{self.ema_scalp_slow_len}']))
+            if current_price < ema_10:
+                # self.log("    -> ОТКЛОНЕНО (PA 1M): Цена ниже EMA 10 (микро-даунтренд).")
+                return None
+                
+            # 5. Volatility Filter
+            atr_14 = Decimal(str(last_candle[f'ATRr_{self.atr_period}']))
+            avg_atr_14 = Decimal(str(ind_1m.iloc[-11:-1][f'ATRr_{self.atr_period}'].mean()))
+            if atr_14 <= avg_atr_14:
+                # self.log("    -> ОТКЛОНЕНО (PA 1M): Низкая волатильность (ATR <= Avg ATR).")
+                return None
+
+        except (ValueError, KeyError, IndexError):
+            return None
+
+        entry_price = current_price
+        
+        # SL: (ATR * 0.6)
+        sl_mult = Decimal('0.6')
+        stop_loss_price = self._round_price(entry_price - (atr_14 * sl_mult))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: R/R 1.0 (Как указано в инструкции: TP1 = 0.5 R/R, Trailing)
+        rr_mult = Decimal('1.0')
+        reward_per_coin = risk_per_coin * rr_mult
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = reward_per_coin / risk_per_coin
+        
+        if rr_ratio < Decimal('1.0'): return None # (Требование R/R >= 1.0)
+
+        log_msg = f"Engulfing" if is_bull_engulf else f"Pin Bar"
+        self.log(f"    -> Кандидат (SCALP_PRICE_ACTION_1M): LONG на 1M ({log_msg} + volume + RSI). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {"type": "SCALP_PRICE_ACTION_1M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
+
+    def _find_entry_scalp_momentum_break_3m(self, market_data, current_price):
+        ind_3m = market_data.get('indicators_3m')
+        # (Проверка на пустой DF из анализа)
+        if ind_3m is None or ind_3m.empty or len(ind_3m) < (self.vol_sma_len + 10):
+            return None
+            
+        try:
+            last_candle = ind_3m.iloc[-1]
+            atr_14 = Decimal(str(last_candle[f'ATRr_{self.atr_period}']))
+            
+            # 1. Breakout Signal
+            resistance = Decimal(str(ind_3m.iloc[-6:-1]['close'].max())) # Max close за 5 предыдущих свечей
+            breakout_level = resistance + (atr_14 * Decimal('0.5'))
+            current_close = Decimal(str(last_candle['close']))
+            
+            if current_close <= breakout_level:
+                return None
+                
+            # 2. MACD Confirmation
+            macd_hist = Decimal(str(last_candle['MACDh_12_26_9']))
+            prev_macd_hist = Decimal(str(ind_3m.iloc[-2]['MACDh_12_26_9']))
+            
+            if not (macd_hist > 0 and macd_hist > prev_macd_hist):
+                # self.log("    -> ОТКЛОНЕНО (MOMENTUM 3M): MACD фильтр не пройден (Hist <= 0 или падает).")
+                return None
+                
+            # 3. Volume & ADX Filter
+            norm_vol = Decimal(str(last_candle['norm_volume']))
+            avg_norm_vol = Decimal(str(last_candle[f'NORM_VOL_SMA_{self.vol_sma_len}']))
+            adx = Decimal(str(last_candle[f'ADX_{self.adx_len}']))
+            
+            if norm_vol <= (avg_norm_vol * Decimal('1.3')) or adx <= 20:
+                # self.log(f"    -> ОТКЛОНЕНО (MOMENTUM 3M): Фильтр Volume ({norm_vol:.1f} <= {avg_norm_vol*Decimal('1.3'):.1f}) или ADX ({adx:.1f} <= 20) не пройден.")
+                return None
+            
+            # 4. Overbought Filter
+            rsi = Decimal(str(last_candle['RSI_14']))
+            if rsi >= 65:
+                # self.log("    -> ОТКЛОНЕНО (MOMENTUM 3M): RSI >= 65 (перекупленность).")
+                return None
+                
+            # 5. Volatility Filter
+            avg_atr_14 = Decimal(str(ind_3m.iloc[-11:-1][f'ATRr_{self.atr_period}'].mean()))
+            if atr_14 <= avg_atr_14:
+                # self.log("    -> ОТКЛОНЕНО (MOMENTUM 3M): Низкая волатильность (ATR <= Avg ATR).")
+                return None
+
+        except (ValueError, KeyError, IndexError):
+            return None
+
+        entry_price = current_price
+        
+        # SL: (ATR * 0.7)
+        sl_mult = Decimal('0.7')
+        stop_loss_price = self._round_price(entry_price - (atr_14 * sl_mult))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: R/R 1.2
+        rr_mult = Decimal('1.2')
+        reward_per_coin = risk_per_coin * rr_mult
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = reward_per_coin / risk_per_coin
+        
+        if rr_ratio < Decimal('1.2'): return None # (Требование R/R >= 1.2)
+
+        self.log(f"    -> Кандидат (SCALP_MOMENTUM_BREAK_3M): LONG на 3M (breakout + MACD + volume/ADX). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {"type": "SCALP_MOMENTUM_BREAK_3M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
+
+    def _find_entry_scalp_bollinger_touch_5m(self, market_data, current_price):
+        ind_5m = market_data.get('indicators_5m')
+        # (Проверка на пустой DF из анализа)
+        if ind_5m is None or ind_5m.empty or len(ind_5m) < (self.vol_sma_len + 5):
+            return None
+            
+        try:
+            last_candle = ind_5m.iloc[-1]
+            prev_candle = ind_5m.iloc[-2]
+
+            # 1. Band Touch Signal
+            bb_low = Decimal(str(last_candle[f'BBL_{self.bb_len}_{self.bb_std}']))
+            current_low = Decimal(str(last_candle['low']))
+            
+            if current_low > bb_low:
+                return None
+                
+            # 2. Reversal Confirmation (RSI + Stoch)
+            rsi = Decimal(str(last_candle['RSI_14']))
+            prev_rsi = Decimal(str(prev_candle['RSI_14']))
+            stoch_k = Decimal(str(last_candle[f'STOCHk_{self.stoch_period}_{self.stoch_k}_{self.stoch_d}']))
+            stoch_d = Decimal(str(last_candle[f'STOCHd_{self.stoch_period}_{self.stoch_k}_{self.stoch_d}']))
+            
+            is_rsi_exit = (prev_rsi < 30) and (rsi > 30)
+            is_stoch_exit = (stoch_k > stoch_d) and (stoch_k > 20) # Crossover + выход из <20
+            
+            if not (is_rsi_exit and is_stoch_exit):
+                # self.log(f"    -> ОТКЛОНЕНО (BB 5M): Reversal фильтр не пройден (RSI Exit: {is_rsi_exit}, Stoch Exit: {is_stoch_exit})")
+                return None
+
+            # 3. Volume Filter
+            norm_vol = Decimal(str(last_candle['norm_volume']))
+            avg_norm_vol = Decimal(str(last_candle[f'NORM_VOL_SMA_{self.vol_sma_len}']))
+            
+            if norm_vol <= (avg_norm_vol * Decimal('1.5')):
+                # self.log(f"    -> ОТКЛОНЕНО (BB 5M): Низкий Norm. Volume ({norm_vol:.2f} <= {avg_norm_vol*Decimal('1.5'):.2f})")
+                return None
+            
+            # 4. Candle Filter
+            if Decimal(str(last_candle['close'])) <= Decimal(str(last_candle['open'])):
+                # self.log(f"    -> ОТКЛОНЕНО (BB 5M): Свеча разворота не бычья (Close <= Open)")
+                return None
+                
+            # 5. Trend Filter (ADX < 25 - боковик)
+            adx = Decimal(str(last_candle[f'ADX_{self.adx_len}']))
+            if adx >= 25:
+                # self.log(f"    -> ОТКЛОНЕНО (BB 5M): ADX >= 25 (не боковик, а тренд)")
+                return None
+                
+            atr_14 = Decimal(str(last_candle[f'ATRr_{self.atr_period}']))
+
+        except (ValueError, KeyError, IndexError):
+            return None
+
+        entry_price = current_price
+        
+        # SL: (ATR * 0.8)
+        sl_mult = Decimal('0.8')
+        stop_loss_price = self._round_price(entry_price - (atr_14 * sl_mult))
+        risk_per_coin = entry_price - stop_loss_price
+        if risk_per_coin <= 0: return None
+        
+        # TP: R/R 1.5
+        rr_mult = Decimal('1.5')
+        reward_per_coin = risk_per_coin * rr_mult
+        target_tp = self._round_price(entry_price + reward_per_coin)
+        rr_ratio = reward_per_coin / risk_per_coin
+        
+        if rr_ratio < Decimal('1.5'): return None # (Требование R/R >= 1.5)
+
+        self.log(f"    -> Кандидат (SCALP_BOLLINGER_TOUCH_5M): LONG на 5M (band touch + reversal + volume). SL={stop_loss_price:.2f}, TP={target_tp:.2f}, R:R={rr_ratio:.2f}")
+        return {"type": "SCALP_BOLLINGER_TOUCH_5M", "entry_price": entry_price, "stop_loss_price": stop_loss_price, "final_take_profit_price": target_tp, "rr_ratio": rr_ratio}
+
+    # ---
+    # --- *** КОНЕЦ: НОВЫЕ СТРАТЕГИИ v1.1 *** ---
+    # ---
+
+    # ---
     # --- ЛОГИКА ОТКРЫТИЯ ПОЗИЦИИ (Изменена v1.0 Scalp) ---
     # ---
     def _calculate_and_open_position(self, best_signal, market_data):
@@ -574,9 +834,10 @@ class TradingBot(threading.Thread):
 
         usdt_balance = market_data['usdt_balance']
         
-        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Риск 0.5x для всех скальп-стратегий ***
+        # *** ИЗМЕНЕНИЕ (v1.1 Scalp): Риск 0.5x для ВСЕХ скальп-стратегий ***
         risk_per_trade = self.base_risk_per_trade
-        if self.current_trade_strategy_type in ["SCALP_LIQUIDITY_SWEEP_3M", "SCALP_RSI_VOLUME_5M", "SCALP_BREAKOUT_CONFIRM_1M"]:
+        # (Проверяем, что это скальпинг-стратегия)
+        if "SCALP_" in self.current_trade_strategy_type:
             risk_per_trade = self.base_risk_per_trade * Decimal('0.5')
             self.log(f"     -> Scalping-стратегия, риск уменьшен до {risk_per_trade * 100:.2f}%")
         # ---
@@ -643,7 +904,7 @@ class TradingBot(threading.Thread):
             self.log(f"КРИТИЧЕСКАЯ ОШИБКА при открытии позиции: {e}"); self._reset_position_state()
 
     # ---
-    # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (v1.0 Scalp - Добавлен Timeout) ---
+    # --- ЛОГИКА УПРАВЛЕНИЯ ВЫХОДОМ (v1.1 Scalp - Добавлен Timeout) ---
     # ---
     def _check_and_manage_exit_conditions(self, market_data, current_price, current_high, current_low, current_1m_candle):
         if not self.position_side: return
@@ -677,12 +938,22 @@ class TradingBot(threading.Thread):
             trade_duration_minutes = (self._get_current_time() - self.entry_time).total_seconds() / 60
             max_duration_minutes = None
             
+            # (Существующие таймауты v1.0)
             if self.current_trade_strategy_type == "SCALP_BREAKOUT_CONFIRM_1M": 
                 max_duration_minutes = 5 # (3-5 мин)
             elif self.current_trade_strategy_type == "SCALP_LIQUIDITY_SWEEP_3M": 
                 max_duration_minutes = 12 # (9-12 мин)
             elif self.current_trade_strategy_type == "SCALP_RSI_VOLUME_5M": 
                 max_duration_minutes = 20 # (15-20 мин)
+                
+            # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.1): Таймауты для новых стратегий ***
+            elif self.current_trade_strategy_type == "SCALP_PRICE_ACTION_1M": 
+                max_duration_minutes = 6 # (3-6 мин)
+            elif self.current_trade_strategy_type == "SCALP_MOMENTUM_BREAK_3M": 
+                max_duration_minutes = 15 # (9-15 мин)
+            elif self.current_trade_strategy_type == "SCALP_BOLLINGER_TOUCH_5M": 
+                max_duration_minutes = 25 # (15-25 мин)
+            # *** КОНЕЦ ИЗМЕНЕНИЯ ***
 
             if max_duration_minutes and trade_duration_minutes >= max_duration_minutes:
                 self.log(f"!!! УПРАВЛЕНИЕ ПО ВРЕМЕНИ (TIMEOUT): Сделка {self.current_trade_strategy_type} >{max_duration_minutes} мин. Принудительное закрытие.")
@@ -904,11 +1175,11 @@ class TradingBot(threading.Thread):
                     except Exception as e: self.log(f"Ошибка в подзадаче {task_type} ({task_info.get('interval', 'N/A')}): {e}"); return None
             
             return {
-                "indicators_1m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1MINUTE)),
-                "indicators_3m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_3MINUTE)),
-                "indicators_5m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_5MINUTE)),
-                "indicators_15m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_15MINUTE)),
-                "indicators_1d": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1DAY)),
+                "indicators_1m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1MINUTE), "1m"),
+                "indicators_3m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_3MINUTE), "3m"),
+                "indicators_5m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_5MINUTE), "5m"),
+                "indicators_15m": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_15MINUTE), "15m"),
+                "indicators_1d": self._calculate_indicators(klines_results.get(Client.KLINE_INTERVAL_1DAY), "1d"),
                 "usdt_balance": Decimal(results.get("usdt_balance", {}).get('free', '0')), 
                 "base_balance": Decimal(results.get("base_balance", {}).get('free', '0')),
                 "current_price": Decimal(results.get("ticker", {}).get('price', '0'))
@@ -916,33 +1187,81 @@ class TradingBot(threading.Thread):
         except Exception as e: self.log(f"Ошибка получения данных: {e}"); return None
 
     def _calculate_indicators(self, klines, interval='N/A'):
-        # (ИЗМЕНЕНО v1.0 Scalp: Добавлены EMA 5, 10. Удалены EMA 9, 21, 50, BB, KC)
-        if not klines or len(klines) < 50: return pd.DataFrame()
+        # (ИЗМЕНЕНО v1.1 Scalp: Добавлены EMA 5, 10, BB, Stoch, Price Action)
+        
+        # (Проверка на пустой список)
+        if not klines: 
+             return pd.DataFrame()
+        
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'trades', 'tbav', 'tqav', 'ig'])
         for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = pd.to_numeric(df[col])
+        
+        # *** НАЧАЛО: ИСПРАВЛЕНИЕ (АНАЛИЗ) ***
+        # Добавляем проверку на NaN и достаточную длину
+        df = df.dropna(subset=['open', 'high', 'low', 'close'])
+        if len(df) < 50:
+            self.log(f"Предупреждение: Недостаточно данных для {interval} ({len(df)} свечей). Пропуск индикаторов.")
+            return pd.DataFrame()
+        # *** КОНЕЦ: ИСПРАВЛЕНИЕ (АНАЛИЗ) ***
+        
         
         # (Новые EMA для скальпинга)
         df.ta.ema(length=self.ema_scalp_fast_len, append=True) # 5
         df.ta.ema(length=self.ema_scalp_slow_len, append=True) # 10
         df.ta.ema(length=self.ema_trend_len, append=True)      # 200
         
-        df.ta.rsi(length=14, append=True); df.ta.atr(length=self.atr_period, append=True); df.ta.stochrsi(append=True)
+        df.ta.rsi(length=self.rsi_period, append=True); df.ta.atr(length=self.atr_period, append=True); df.ta.stochrsi(append=True)
         df.ta.adx(length=self.adx_len, append=True)
         
-        # (Удалены BBANDS и KC)
+        # (BBANDS НУЖНЫ)
         
         df[f'VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['volume'], length=self.vol_sma_len)
         
         # (Нормализованный объем)
         atr_col = f'ATRr_{self.atr_period}'
-        safe_atr = df[atr_col].replace(0, np.nan).fillna(method='ffill').fillna(1) 
+        
+        # *** ИСПРАВЛЕНИЕ (v1.1): Замена fillna(method='ffill') на .ffill() ***
+        safe_atr = df[atr_col].replace(0, np.nan).ffill().fillna(1)
+        
         safe_atr[safe_atr == 0] = 1 
         df['norm_volume'] = df['volume'] / safe_atr
         df[f'NORM_VOL_SMA_{self.vol_sma_len}'] = ta.sma(df['norm_volume'], length=self.vol_sma_len)
         
         # (MACD)
         df.ta.macd(append=True) 
+
+        # *** НАЧАЛО ИЗМЕНЕНИЯ (v1.1): Новые индикаторы ***
         
+        # (Bollinger Bands)
+        df.ta.bbands(length=self.bb_len, std=self.bb_std, append=True)
+        
+        # (Standard Stochastic)
+        df.ta.stoch(length=self.stoch_period, k=self.stoch_k, d=self.stoch_d, append=True)
+        
+        # (Price Action Patterns - manual calculation)
+        try:
+            # Bullish Engulfing (Current open < prev close, Current close > prev open, Current close > prev high)
+            df['bull_engulf'] = (df['open'] < df['close'].shift(1)) & \
+                                 (df['close'] > df['open'].shift(1)) & \
+                                 (df['close'] > df['high'].shift(1))
+            
+            # Pin Bar (Low < 3-bar low, Close > 70% of candle range from bottom)
+            # (Используем rolling(4) для 3 предыдущих + текущая, затем shift(1) для 3 предыдущих)
+            rolling_low = df['low'].rolling(window=4, min_periods=4).min().shift(1)
+            candle_range = df['high'] - df['low']
+            
+            # *** ИСПРАВЛЕНИЕ (v1.1): Замена Decimal('0.7') на float 0.7 ***
+            candle_body_threshold = df['open'] + (candle_range * 0.7)
+            
+            df['pin_bar'] = (df['low'] < rolling_low) & \
+                            (df['close'] > candle_body_threshold) & \
+                            (candle_range > 0)
+        except Exception as e:
+            # self.log(f"Предупреждение: не удалось рассчитать PA паттерны: {e}")
+            df['bull_engulf'] = False
+            df['pin_bar'] = False
+        # *** КОНЕЦ ИЗМЕНЕНИЯ ***
+            
         return df
     
     def _log_daily_status(self, reason):
@@ -1005,7 +1324,7 @@ class TradingBot(threading.Thread):
         
         self.event_queue.put({'type': 'dashboard_update', 'data': data})
         
-        # (Обновление статистики по новым стратегиям)
+        # (Обновление статистики по новым стратегиям v1.1)
         stats_data = {}
         for stype in self.strategy_types:
             if stype == "UNKNOWN": continue
@@ -1031,7 +1350,7 @@ class TradingBot(threading.Thread):
             return datetime.fromtimestamp(self.binance_client.get_server_time()['serverTime'] / 1000, tz=UTC)
     
     def _finalize_run(self):
-        # (Эта функция без изменений, self.strategy_types обновлен)
+        # (Эта функция без изменений, self.strategy_types обновлен v1.1)
         self._save_state()
         if not self.stop_event.is_set():
             self.log("\n" + "="*50)

@@ -38,7 +38,7 @@ except ImportError:
     exit()
 
 # --- Импорт кастомных классов из других файлов ---
-# (v1.0 Scalp)
+# (v1.1 Scalp)
 from trading_bot import TradingBot 
 from mock_binance_client import MockBinanceClient
 
@@ -47,8 +47,8 @@ from mock_binance_client import MockBinanceClient
 class App:
     def __init__(self, root):
         self.root = root
-        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Обновлен заголовок ***
-        self.root.title("Scalping Bot v1.0 (2025 Filters)")
+        # *** ИЗМЕНЕНИЕ (v1.1 Scalp): Обновлен заголовок ***
+        self.root.title("Scalping Bot v1.1 (2025 Filters - 6 Strategies)")
         self.root.geometry("1440x900") # Ширина x Высота
         self.root.bind("<Configure>", self._resize_columns)
         self.event_queue = queue.Queue()
@@ -138,15 +138,18 @@ class App:
         # *** ИЗМЕНЕНИЕ (v1.0 Scalp): R/R по умолчанию 1.2 ***
         self.rr_ratio_var = tk.StringVar(value="1.2"); ttk.Entry(settings_frame, textvariable=self.rr_ratio_var, width=8).grid(row=3, column=1, sticky="w", padx=3, pady=3)
 
-        # --- ФРЕЙМ: Конфигурация стратегий (v1.0 Scalp) ---
+        # --- ФРЕЙМ: Конфигурация стратегий (v1.1 Scalp) ---
         strategy_config_frame = ttk.LabelFrame(scrollable_frame, text="Активные стратегии"); 
         strategy_config_frame.pack(fill="x", padx=3, pady=5, ipady=3)
         
-        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Новые стратегии ***
+        # *** ИЗМЕНЕНИЕ (v1.1 Scalp): Новые стратегии (всего 6) ***
         self.strategy_display_names = {
             "SCALP_LIQUIDITY_SWEEP_3M": "Scalp (Sweep 3M)", 
             "SCALP_RSI_VOLUME_5M": "Scalp (RSI + Vol 5M)", 
-            "SCALP_BREAKOUT_CONFIRM_1M": "Scalp (Breakout 1M)"
+            "SCALP_BREAKOUT_CONFIRM_1M": "Scalp (Breakout 1M)",
+            "SCALP_PRICE_ACTION_1M": "Scalp (Price Action 1M)",
+            "SCALP_MOMENTUM_BREAK_3M": "Scalp (Momentum 3M)",
+            "SCALP_BOLLINGER_TOUCH_5M": "Scalp (Bollinger 5M)"
         }
         
         for stype, name in self.strategy_display_names.items():
@@ -185,7 +188,7 @@ class App:
         ttk.Label(self.strategy_stats_frame, text="PnL ($)", font=("Arial", 9, "bold"), anchor="e").grid(row=0, column=1, sticky="ew", padx=3, pady=2)
         ttk.Label(self.strategy_stats_frame, text="W/R (W/L)", font=("Arial", 9, "bold"), anchor="e").grid(row=0, column=2, sticky="ew", padx=3, pady=2)
         i = 1
-        # *** ИЗМЕНЕНИЕ (v1.0 Scalp): Обновление статистики для новых стратегий ***
+        # *** ИЗМЕНЕНИЕ (v1.1 Scalp): Обновление статистики для новых стратегий ***
         for stype, name in self.strategy_display_names.items():
             ttk.Label(self.strategy_stats_frame, text=f"{name}:").grid(row=i, column=0, sticky="w", padx=3, pady=1)
             lbl_pnl = ttk.Label(self.strategy_stats_frame, text="N/A", font=("Arial", 8), anchor="e"); lbl_pnl.grid(row=i, column=1, sticky="ew", padx=3, pady=1)
